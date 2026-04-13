@@ -1,0 +1,5 @@
+{
+  "name": "Pack Semicircles",
+  "description": "Pack 15 unit semicircles into the smallest possible enclosing circle",
+  "requestFramePermissions": []
+}

@@ -1,0 +1,21 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+__pycache__/
+*.pyc
+.ruff_cache/
+semicircle_best.json
+
+# Intermediate optimizer iterations
+opt*.py
+optimize*.py
+
+# Ops scripts (contain infrastructure details)
+sync_best.sh
+monitor.sh
+debug_overlap.mjs
