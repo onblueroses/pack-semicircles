@@ -19,3 +19,4 @@ optimize*.py
 sync_best.sh
 monitor.sh
 debug_overlap.mjs
+test_geom.py
