@@ -20,3 +20,5 @@ sync_best.sh
 monitor.sh
 debug_overlap.mjs
 test_geom.py
+best_*.json
+done_*.flag
