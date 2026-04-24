@@ -150,6 +150,19 @@ def test_basin_tabu_matches_archive_dedup_rule():
     print("OK: BasinTabu collides on noise, separates on real basin change")
 
 
+def test_basin_tabu_arms_on_first_visit():
+    """Regression (codex round 3): BasinTabu previously only stored sigs on
+    is_dup=True. First revisit therefore always missed. Now first visit
+    arms at start tenure so the second visit hits."""
+    tabu = md.BasinTabu(min_l2=0.08, start=30)
+    scs = load_incumbent()
+    sig = md._basin_signature(scs)
+    tabu.note(sig, is_dup=False)
+    assert tabu.size() == 1, "first-visit note must store the signature"
+    assert tabu.hit(sig), "second visit should hit tabu after first-visit arming"
+    print("OK: BasinTabu arms on first visit (blocks on second)")
+
+
 def test_basin_tabu_decay_and_reset():
     tabu = md.BasinTabu(min_l2=0.08, start=5, step_up=2, step_down=1, decay_every=3)
     scs = load_incumbent()
@@ -223,6 +236,7 @@ def main():
     test_reactive_tabu_full_reset_on_accepts()
     test_restart_temperature_scales_with_observed_spread()
     test_basin_tabu_matches_archive_dedup_rule()
+    test_basin_tabu_arms_on_first_visit()
     test_basin_tabu_decay_and_reset()
     test_driver_smoke_produces_parseable_events()
     test_reducer_tolerates_mbh_telemetry()

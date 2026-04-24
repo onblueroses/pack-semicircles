@@ -62,17 +62,42 @@ def _resolve_penalty(x: np.ndarray, cx: float, cy: float, R: float) -> float:
     return pair_pen + cont
 
 
+def _worst_gap(scs: np.ndarray, cx: float, cy: float, R: float) -> float:
+    """Return the minimum (most negative) gap across pair + containment."""
+    worst = float("inf")
+    for i in range(geom.N):
+        g = attack4.contain_gap_exact(scs[i, 0], scs[i, 1], scs[i, 2], cx, cy, R)
+        if g < worst:
+            worst = g
+        for j in range(i + 1, geom.N):
+            g = gapmod.gap_ss(
+                scs[i, 0],
+                scs[i, 1],
+                scs[i, 2],
+                scs[j, 0],
+                scs[j, 1],
+                scs[j, 2],
+            )
+            if g < worst:
+                worst = g
+    return worst
+
+
 def resolve_overlap(
     scs: np.ndarray,
     cx: float,
     cy: float,
     R: float,
     maxiter: int = 1000,
-    tol: float = 1e-3,
-) -> tuple[np.ndarray, float, bool]:
-    """Gradient-descent overlap-resolve at fixed (cx, cy, R). Containment is
-    scored against the BEFORE-state MEC — Stage A subsequently re-optimizes
-    the center. Returns (scs_out, penalty, ok)."""
+    max_deficit: float = 5e-3,
+) -> tuple[np.ndarray, float, float, bool]:
+    """Gradient-descent overlap-resolve at fixed (cx, cy, R). Returns
+    (scs_out, total_penalty, worst_negative_gap, ok).
+
+    Gate is based on worst INDIVIDUAL negative gap (max_deficit), not the
+    sum-of-squares total. sum-of-squares can be tiny while one pair is
+    wildly overlapping; that single pair then poisons Stage A.
+    """
     x0 = scs.reshape(-1).copy()
     res = opt.minimize(
         _resolve_penalty,
@@ -81,8 +106,11 @@ def resolve_overlap(
         method="L-BFGS-B",
         options={"maxiter": maxiter, "ftol": 1e-12, "gtol": 1e-8},
     )
-    pen = float(res.fun)
-    return res.x.reshape(geom.N, 3), pen, pen < tol
+    scs_out = res.x.reshape(geom.N, 3)
+    worst = _worst_gap(scs_out, cx, cy, R)
+    # ok if worst negative gap is within tolerance (i.e. -worst < max_deficit)
+    ok = worst > -max_deficit
+    return scs_out, float(res.fun), worst, ok
 
 
 # ---------- reactive tabu ----------
@@ -259,8 +287,12 @@ class BasinTabu:
         return i >= 0 and self._tenure[i] > 0
 
     def note(self, sig: np.ndarray, is_dup: bool) -> None:
+        """Record a basin visit. On is_dup=True, escalate tenure. On
+        is_dup=False (first visit), arm at start tenure so the NEXT visit
+        actually hits. Previous behavior (only storing on is_dup=True) meant
+        a basin had to be visited 3× before tabu could skip it."""
+        i = self._find(sig)
         if is_dup:
-            i = self._find(sig)
             if i >= 0:
                 self._tenure[i] = min(self._tenure[i] + self.step_up, self.cap)
             else:
@@ -268,6 +300,10 @@ class BasinTabu:
                 self._tenure.append(min(self.start + self.step_up, self.cap))
             self._no_dup_iters = 0
         else:
+            # First visit: arm at start tenure so the second visit is blocked.
+            if i < 0:
+                self._sigs.append(sig)
+                self._tenure.append(self.start)
             self._no_dup_iters += 1
             if self._no_dup_iters >= self.decay_every:
                 self._decay()
@@ -314,7 +350,9 @@ class DriverConfig:
     incumbent_path: str
     R_target: float = 2.9486936795
     R_resolve_slack: float = 0.10  # resolve at R_target + slack (room to untangle)
-    resolve_tol: float = 5e-2  # lenient — Stage A does the final polish
+    resolve_max_deficit: float = 5e-3  # worst single-gap deficit before reject
+    min_pair_gap: float = -5e-6  # post-Stage A pair gate (scorer-safe margin)
+    stage_a_max_violation: float = 5e-4  # attack4 constr_violation ceiling
     hours: float = 0.5
     max_iters: int | None = None
     K_restart: int = 30
@@ -343,6 +381,13 @@ def run(cfg: DriverConfig) -> dict:
     snap_path = Path(cfg.archive_path)
 
     def _snapshot():
+        # Durability ordering (mirrors archive_reducer.snapshot):
+        # 1. fsync the event log FIRST — never publish a snapshot that
+        #    names events the durable log doesn't contain. Propagate OSError.
+        # 2. write tmp → flush → fsync tmp.
+        # 3. os.replace(tmp, snap).
+        # 4. fsync parent dir so the rename itself is durable.
+        os.fdatasync(events_fd)
         payload = archive.payload("mbh", best_score)
         payload["iters"] = stats["iters"]
         payload["accepts"] = stats["accepts"]
@@ -353,10 +398,11 @@ def run(cfg: DriverConfig) -> dict:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, snap_path)
+        dir_fd = os.open(snap_path.parent, os.O_RDONLY)
         try:
-            os.fdatasync(events_fd)
-        except OSError:
-            pass
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
 
     # Graceful stop: SIGTERM → stop_requested[0]=True.
     stop_requested = [False]
@@ -443,8 +489,12 @@ def run(cfg: DriverConfig) -> dict:
 
         # ---- resolve + Stage A
         cx_before, cy_before, _ = geom.mec_info(current)
-        scs_resolved, pen, ok = resolve_overlap(
-            res.scs, cx_before, cy_before, R_resolve, tol=cfg.resolve_tol
+        scs_resolved, pen, worst_gap, ok = resolve_overlap(
+            res.scs,
+            cx_before,
+            cy_before,
+            R_resolve,
+            max_deficit=cfg.resolve_max_deficit,
         )
         if not ok:
             stats["resolve_failed"] += 1
@@ -456,6 +506,7 @@ def run(cfg: DriverConfig) -> dict:
                     "trial": trial,
                     "reason": "resolve_failed",
                     "penalty": float(pen),
+                    "worst_gap": float(worst_gap),
                     "move": res.move_type,
                 },
             )
@@ -491,7 +542,10 @@ def run(cfg: DriverConfig) -> dict:
             )
             continue
 
-        if not res_a.get("success", False):
+        # success flag is unreliable — attack4.stage_a returns True even on
+        # trust-min exits. Gate on constr_violation + raw min-gap instead.
+        violation = float(res_a.get("constr_violation", 0.0))
+        if violation > cfg.stage_a_max_violation:
             stats["stage_a_failed"] += 1
             stats["since_insert"] += 1
             ar.append_event(
@@ -499,14 +553,48 @@ def run(cfg: DriverConfig) -> dict:
                 {
                     "type": "reject",
                     "trial": trial,
-                    "reason": "stage_a_unsuccessful",
+                    "reason": "stage_a_constr_violation",
+                    "violation": violation,
                     "move": res.move_type,
                 },
             )
             continue
 
-        scs_final = geom.rnd(res_a["scs"])
+        # Pre-round min-gap gate — catches genuine overlap regardless of
+        # whether rnd flips an active constraint. Cheaper than geom.cnt on
+        # rounded config and distinguishes real overlap from rounding noise.
+        scs_stage = res_a["scs"]
+        min_pair_gap = float("inf")
+        for i in range(geom.N):
+            for j in range(i + 1, geom.N):
+                g = gapmod.gap_ss(
+                    scs_stage[i, 0],
+                    scs_stage[i, 1],
+                    scs_stage[i, 2],
+                    scs_stage[j, 0],
+                    scs_stage[j, 1],
+                    scs_stage[j, 2],
+                )
+                if g < min_pair_gap:
+                    min_pair_gap = g
+        if min_pair_gap < cfg.min_pair_gap:
+            stats["stage_a_failed"] += 1
+            stats["since_insert"] += 1
+            ar.append_event(
+                events_fd,
+                {
+                    "type": "reject",
+                    "trial": trial,
+                    "reason": "pair_overlap",
+                    "min_pair_gap": min_pair_gap,
+                    "move": res.move_type,
+                },
+            )
+            continue
+
+        scs_final = geom.rnd(scs_stage)
         if int(geom.cnt(scs_final)) != 0:
+            # Should be rare given the pre-round gate. Still a safety net.
             stats["stage_a_failed"] += 1
             stats["since_insert"] += 1
             ar.append_event(
