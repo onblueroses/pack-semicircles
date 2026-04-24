@@ -580,24 +580,15 @@ def run(cfg: DriverConfig) -> dict:
             )
             continue
 
-        # Pre-round min-gap gate — catches genuine overlap regardless of
-        # whether rnd flips an active constraint. Cheaper than geom.cnt on
-        # rounded config and distinguishes real overlap from rounding noise.
+        # Pre-round worst-gap gate — catches both pair AND containment overlap
+        # regardless of whether rnd flips an active constraint. Distinguishes
+        # real overlap from rounding noise.
         scs_stage = res_a["scs"]
-        min_pair_gap = float("inf")
-        for i in range(geom.N):
-            for j in range(i + 1, geom.N):
-                g = gapmod.gap_ss(
-                    scs_stage[i, 0],
-                    scs_stage[i, 1],
-                    scs_stage[i, 2],
-                    scs_stage[j, 0],
-                    scs_stage[j, 1],
-                    scs_stage[j, 2],
-                )
-                if g < min_pair_gap:
-                    min_pair_gap = g
-        if min_pair_gap < cfg.min_pair_gap:
+        stage_cx = float(res_a.get("cx", 0.0))
+        stage_cy = float(res_a.get("cy", 0.0))
+        stage_R = float(res_a.get("R", 0.0))
+        worst_stage_gap = _worst_gap(scs_stage, stage_cx, stage_cy, stage_R)
+        if worst_stage_gap < cfg.min_pair_gap:
             stats["stage_a_failed"] += 1
             stats["since_insert"] += 1
             ar.append_event(
@@ -605,8 +596,8 @@ def run(cfg: DriverConfig) -> dict:
                 {
                     "type": "reject",
                     "trial": trial,
-                    "reason": "pair_overlap",
-                    "min_pair_gap": min_pair_gap,
+                    "reason": "stage_a_overlap",
+                    "worst_gap": worst_stage_gap,
                     "move": res.move_type,
                 },
             )
