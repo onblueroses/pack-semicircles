@@ -123,27 +123,57 @@ def test_restart_temperature_scales_with_observed_spread():
     )
 
 
-# ---------- _basin_key invariance ----------
+# ---------- BasinTabu (L2-distance) ----------
 
 
-def test_basin_key_invariant_under_translation():
+def test_basin_tabu_matches_archive_dedup_rule():
+    """L2-distance tabu must collide same-basin noise (|δ|~1e-6) but reject
+    genuinely distinct basins. Matches BasinArchive min_l2=0.08."""
     scs = load_incumbent()
-    k1 = md._basin_key(scs)
-    scs2 = scs.copy()
-    scs2[:, 0] += 0.17
-    scs2[:, 1] -= 0.05
-    k2 = md._basin_key(geom.rnd(scs2))
-    assert k1 == k2, f"translation changed basin key: {k1[:3]}... vs {k2[:3]}..."
-    print("OK: _basin_key is translation-invariant")
+    sig = md._basin_signature(scs)
+    # tiny noise: same basin, different 6dp key
+    noise = scs.copy()
+    noise[0, 0] += 1e-6
+    sig_noise = md._basin_signature(geom.rnd(noise))
+
+    tabu = md.BasinTabu(min_l2=0.08)
+    tabu.note(sig, is_dup=True)
+    assert tabu.hit(sig_noise), (
+        "noise-perturbed signature should collide with tabu'd incumbent"
+    )
+    # A very different config (scaled) should NOT hit.
+    center = scs[:, :2].mean(axis=0)
+    scaled = scs.copy()
+    scaled[:, :2] = center + 1.10 * (scaled[:, :2] - center)
+    scaled_sig = md._basin_signature(geom.rnd(scaled))
+    assert not tabu.hit(scaled_sig), "scaled basin incorrectly tabu'd"
+    print("OK: BasinTabu collides on noise, separates on real basin change")
+
+
+def test_basin_tabu_decay_and_reset():
+    tabu = md.BasinTabu(min_l2=0.08, start=5, step_up=2, step_down=1, decay_every=3)
+    scs = load_incumbent()
+    sig = md._basin_signature(scs)
+    tabu.note(sig, is_dup=True)
+    assert tabu.size() == 1
+    for _ in range(3):
+        tabu.note(md._basin_signature(load_incumbent()), is_dup=False)  # no-op sig
+    # After decay, tenure should have dropped by step_down=1
+    # (initial tenure = start + step_up = 7; after 1 decay = 6; still > 0)
+    assert tabu.size() == 1 and tabu._tenure[0] == 6
+    tabu.reset()
+    assert tabu.size() == 0
+    print("OK: BasinTabu decays tenure + resets cleanly")
 
 
 # ---------- end-to-end driver: basin tabu actually blocks revisits ----------
 
 
-def test_driver_basin_tabu_blocks_revisit():
-    """Run a short driver session, confirm a tabu'd basin won't re-enter
-    the archive. We force the scenario by seeding the archive twice with
-    the same basin signature and checking visited_basins growth."""
+def test_driver_smoke_produces_parseable_events():
+    """Run 3 iters end-to-end; verify the event log is complete (one event
+    per iter) and every line parses. Separately, the unit-level tabu tests
+    above prove blocking semantics — this test only guards against runtime
+    regressions in the loop plumbing."""
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         cfg = md.DriverConfig(
@@ -157,13 +187,34 @@ def test_driver_basin_tabu_blocks_revisit():
         )
         summary = md.run(cfg)
         assert summary["iters"] == 3
-        # No strict assertion on accepts — depends on move RNG. Key point:
-        # visited_basins must contain at least the incumbent signature after
-        # a successful iter. Here we just verify no crash + event log parseable.
         lines = (td / "events.jsonl").read_text().splitlines()
+        # Every iteration must emit exactly one event (either accept, duplicate,
+        # or reject). move_tabu-skip path also emits now.
+        assert len(lines) >= summary["iters"], (
+            f"events ({len(lines)}) < iters ({summary['iters']}) — log gap"
+        )
         for line in lines:
             json.loads(line)
-        print(f"OK: driver ran 3 iters, {len(lines)} events, no crash")
+        print(f"OK: driver ran 3 iters, {len(lines)} events ≥ iters, all parseable")
+
+
+def test_reducer_tolerates_mbh_telemetry():
+    """HIGH regression: mbh_driver emits reject/restart/duplicate without scs.
+    apply_event_to_archive must skip those cleanly instead of KeyError'ing."""
+    import archive_reducer as ar
+    import basin_archive
+
+    arch = basin_archive.BasinArchive()
+    # telemetry-only events
+    for ev in [
+        {"type": "reject", "trial": 1, "reason": "resolve_failed", "move": "flip_one"},
+        {"type": "restart", "trial": 7, "from_rank": 2},
+        {"type": "duplicate", "trial": 9, "score": 2.95, "move": "rim_swap", "D": 4.0},
+    ]:
+        result = ar.apply_event_to_archive(arch, ev)
+        assert result is None, f"telemetry event should skip, got {result}"
+    assert arch.size() == 0
+    print("OK: reducer skips telemetry events instead of KeyError")
 
 
 def main():
@@ -171,8 +222,10 @@ def main():
     test_reactive_tabu_escalates_on_dup_and_decays()
     test_reactive_tabu_full_reset_on_accepts()
     test_restart_temperature_scales_with_observed_spread()
-    test_basin_key_invariant_under_translation()
-    test_driver_basin_tabu_blocks_revisit()
+    test_basin_tabu_matches_archive_dedup_rule()
+    test_basin_tabu_decay_and_reset()
+    test_driver_smoke_produces_parseable_events()
+    test_reducer_tolerates_mbh_telemetry()
     print("\nALL PASS")
 
 

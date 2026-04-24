@@ -107,7 +107,11 @@ def replay_archive_events(path: str | os.PathLike, on_event) -> tuple[int, int]:
 
 
 def apply_event_to_archive(archive: basin_archive.BasinArchive, event: dict):
-    """Default event applier: feeds {scs, score, trial, label} to archive.consider."""
+    """Default event applier. Events that don't carry a config (telemetry-only
+    records like 'reject'/'restart'/'duplicate' from mbh_driver) are skipped.
+    Events with 'scs' are fed to archive.consider."""
+    if "scs" not in event:
+        return None
     scs = np.asarray(event["scs"], dtype=np.float64)
     return archive.consider(
         scs,

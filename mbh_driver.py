@@ -216,11 +216,81 @@ def _move_key(res: "pl.PerturbResult") -> tuple[str, frozenset[int]]:
     return (res.move_type, pieces)
 
 
-def _basin_key(scs: np.ndarray) -> tuple:
-    """Canonical basin key for tabu (round to 6 decimals to compress near-
-    duplicates through noisy Stage A outputs)."""
-    sig = basin_archive.solution_signature(scs)
-    return tuple(np.round(sig, 6).tolist())
+def _basin_signature(scs: np.ndarray) -> np.ndarray:
+    """Canonical basin signature (rigid-motion + permutation invariant).
+    Use signature_l2 for equivalence comparisons — exact tuple equality is
+    far too strict and fragments same-basin revisits on solver noise."""
+    return basin_archive.solution_signature(scs)
+
+
+class BasinTabu:
+    """L2-distance tabu list for basin signatures. Matches BasinArchive's
+    same-basin criterion (signature_l2 < min_l2), so tabu and archive agree on
+    what counts as a revisit."""
+
+    def __init__(
+        self,
+        min_l2: float = 0.08,
+        start: int = 30,
+        step_up: int = 5,
+        step_down: int = 1,
+        cap: int = 60,
+        decay_every: int = 50,
+    ):
+        self.min_l2 = min_l2
+        self.start = start
+        self.step_up = step_up
+        self.step_down = step_down
+        self.cap = cap
+        self.decay_every = decay_every
+        # Parallel lists: sig rows + tenures + last-seen iter
+        self._sigs: list[np.ndarray] = []
+        self._tenure: list[int] = []
+        self._no_dup_iters = 0
+
+    def _find(self, sig: np.ndarray) -> int:
+        for i, s in enumerate(self._sigs):
+            if basin_archive.signature_l2(s, sig) < self.min_l2:
+                return i
+        return -1
+
+    def hit(self, sig: np.ndarray) -> bool:
+        i = self._find(sig)
+        return i >= 0 and self._tenure[i] > 0
+
+    def note(self, sig: np.ndarray, is_dup: bool) -> None:
+        if is_dup:
+            i = self._find(sig)
+            if i >= 0:
+                self._tenure[i] = min(self._tenure[i] + self.step_up, self.cap)
+            else:
+                self._sigs.append(sig)
+                self._tenure.append(min(self.start + self.step_up, self.cap))
+            self._no_dup_iters = 0
+        else:
+            self._no_dup_iters += 1
+            if self._no_dup_iters >= self.decay_every:
+                self._decay()
+                self._no_dup_iters = 0
+
+    def _decay(self) -> None:
+        keep_sigs: list[np.ndarray] = []
+        keep_ten: list[int] = []
+        for s, t in zip(self._sigs, self._tenure):
+            t -= self.step_down
+            if t > 0:
+                keep_sigs.append(s)
+                keep_ten.append(t)
+        self._sigs = keep_sigs
+        self._tenure = keep_ten
+
+    def reset(self) -> None:
+        self._sigs.clear()
+        self._tenure.clear()
+        self._no_dup_iters = 0
+
+    def size(self) -> int:
+        return len(self._sigs)
 
 
 # ---------- event emission ----------
@@ -259,6 +329,7 @@ def run(cfg: DriverConfig) -> dict:
     rng = np.random.default_rng(cfg.seed)
     archive = basin_archive.BasinArchive(slots=32, min_l2=0.08)
     tabu = ReactiveTabu()
+    basin_tabu = BasinTabu(min_l2=0.08)  # L2-based, matches archive dedup rule
 
     # Seed archive with incumbent.
     scs_inc = np.array(json.load(open(cfg.incumbent_path))["scs"], dtype=np.float64)
@@ -328,7 +399,6 @@ def run(cfg: DriverConfig) -> dict:
         f"[mbh] start R_target={cfg.R_target} R_resolve={R_resolve} hours={cfg.hours}"
     )
 
-    visited_basins: set[tuple] = set()
     while not _time_up():
         stats["iters"] += 1
         trial = stats["iters"]
@@ -342,6 +412,7 @@ def run(cfg: DriverConfig) -> dict:
             stats["since_insert"] = 0
             tabu.basin_tenure.clear()
             tabu.move_tenure.clear()
+            basin_tabu.reset()
             ar.append_event(
                 events_fd,
                 {"type": "restart", "trial": trial, "from_rank": current_idx},
@@ -358,6 +429,16 @@ def run(cfg: DriverConfig) -> dict:
         if tabu.hit_move(move_key):
             stats["tabu_skips"] += 1
             stats["since_insert"] += 1
+            # Emit a reject so the event log has a record for every iter.
+            ar.append_event(
+                events_fd,
+                {
+                    "type": "reject",
+                    "trial": trial,
+                    "reason": "move_tabu",
+                    "move": res.move_type,
+                },
+            )
             continue
 
         # ---- resolve + Stage A
@@ -440,15 +521,14 @@ def run(cfg: DriverConfig) -> dict:
             continue
         score_final = float(geom.mec(scs_final))
 
-        # ---- basin tabu: key on the candidate's canonical signature, not
-        # archive.entries[0]. Archive can evict entries past the 32-slot cap,
-        # so we track visited separately.
-        candidate_key = _basin_key(scs_final)
-        was_visited = candidate_key in visited_basins
-        if tabu.hit_basin(candidate_key):
+        # ---- basin tabu: compare candidate signature to the L2-distance tabu
+        # list. Matches BasinArchive's dedup rule (min_l2=0.08) so tabu +
+        # archive agree on what counts as "same basin".
+        candidate_sig = _basin_signature(scs_final)
+        if basin_tabu.hit(candidate_sig):
             stats["tabu_skips"] += 1
             stats["since_insert"] += 1
-            tabu.note_basin(candidate_key, is_dup=True)
+            basin_tabu.note(candidate_sig, is_dup=True)
             tabu.note_move(move_key, is_dup=True)
             ar.append_event(
                 events_fd,
@@ -460,7 +540,6 @@ def run(cfg: DriverConfig) -> dict:
                 },
             )
             continue
-        visited_basins.add(candidate_key)
 
         # ---- archive
         before_size = archive.size()
@@ -468,11 +547,8 @@ def run(cfg: DriverConfig) -> dict:
             scs_final, score_final, trial=trial, label=res.move_type
         )
         is_new = event is not None
-        is_dup_archive = not is_new
-        # A basin we've *visited* before but isn't in the retained archive
-        # still counts as a duplicate for tabu escalation purposes.
-        is_dup = is_dup_archive or was_visited
-        tabu.note_basin(candidate_key, is_dup=is_dup)
+        is_dup = not is_new  # duplicate at archive level == same basin
+        basin_tabu.note(candidate_sig, is_dup=is_dup)
         tabu.note_move(move_key, is_dup=is_dup)
 
         if is_new:
