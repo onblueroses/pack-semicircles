@@ -384,6 +384,21 @@ def run(cfg: DriverConfig) -> dict:
     events_fd = ar.open_append_fd(cfg.events_path)
     snap_path = Path(cfg.archive_path)
 
+    # Emit a replayable seed event FIRST so archive_reducer replay can rebuild
+    # the same state the driver started with. Without this, replay from a log
+    # with zero iters produces an empty archive while the live snapshot has
+    # the incumbent.
+    ar.append_event(
+        events_fd,
+        {
+            "type": "accept",
+            "trial": -1,
+            "score": R_inc,
+            "scs": scs_inc.tolist(),
+            "label": "incumbent",
+        },
+    )
+
     def _snapshot():
         # Durability ordering (mirrors archive_reducer.snapshot):
         # 1. fsync the event log FIRST — never publish a snapshot that

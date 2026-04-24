@@ -212,6 +212,35 @@ def test_driver_smoke_produces_parseable_events():
         print(f"OK: driver ran 3 iters, {len(lines)} events ≥ iters, all parseable")
 
 
+def test_replay_includes_incumbent_seed():
+    """Regression (codex round 6): zero-iteration run must still produce a
+    replayable log containing the incumbent seed. Otherwise crash-recovery
+    rebuilds an empty archive while the live snapshot has the seed."""
+    import archive_reducer as ar
+    import basin_archive
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        cfg = md.DriverConfig(
+            events_path=str(td / "events.jsonl"),
+            archive_path=str(td / "archive.json"),
+            incumbent_path="pool/best.json",
+            hours=0,
+            max_iters=0,
+            snapshot_every_s=999,
+        )
+        md.run(cfg)
+        arch = basin_archive.BasinArchive(slots=8, min_l2=0.08)
+        ar.replay_archive_events(
+            td / "events.jsonl",
+            lambda ev: ar.apply_event_to_archive(arch, ev),
+        )
+        assert arch.size() == 1, (
+            f"replay missed incumbent seed: archive_size={arch.size()}"
+        )
+        print(f"OK: zero-iter replay rebuilds incumbent (archive_size={arch.size()})")
+
+
 def test_reducer_can_rebuild_archive_from_mbh_log():
     """Regression (codex round 4): accept events must carry scs so the reducer
     can rebuild archive state from the log. Previously skipped silently."""
@@ -329,6 +358,7 @@ def main():
     test_basin_tabu_decay_and_reset()
     test_driver_smoke_produces_parseable_events()
     test_reducer_tolerates_mbh_telemetry()
+    test_replay_includes_incumbent_seed()
     test_reducer_can_rebuild_archive_from_mbh_log()
     test_replay_preserves_same_basin_improvement()
     print("\nALL PASS")
