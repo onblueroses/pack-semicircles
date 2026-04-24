@@ -211,6 +211,44 @@ def test_driver_smoke_produces_parseable_events():
         print(f"OK: driver ran 3 iters, {len(lines)} events ≥ iters, all parseable")
 
 
+def test_reducer_can_rebuild_archive_from_mbh_log():
+    """Regression (codex round 4): accept events must carry scs so the reducer
+    can rebuild archive state from the log. Previously skipped silently."""
+    import archive_reducer as ar
+    import basin_archive
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        cfg = md.DriverConfig(
+            events_path=str(td / "events.jsonl"),
+            archive_path=str(td / "archive.json"),
+            incumbent_path="pool/best.json",
+            hours=1,
+            max_iters=10,
+            seed=3,
+            snapshot_every_s=999,
+        )
+        summary = md.run(cfg)
+        if summary["accepts"] == 0:
+            print("SKIP: no accepts in 10 iters, can't test reducer rebuild")
+            return
+        replay_archive = basin_archive.BasinArchive(slots=32, min_l2=0.08)
+        n, _ = ar.replay_archive_events(
+            td / "events.jsonl",
+            lambda ev: ar.apply_event_to_archive(replay_archive, ev),
+        )
+        # Rebuilt archive should include at least the accepts (may differ from
+        # live archive because live includes the incumbent seed too).
+        assert replay_archive.size() >= summary["accepts"], (
+            f"reducer rebuilt {replay_archive.size()} basins, "
+            f"expected >= {summary['accepts']} accepts"
+        )
+        print(
+            f"OK: reducer rebuilt archive size={replay_archive.size()} "
+            f"from {n} events ({summary['accepts']} accepts)"
+        )
+
+
 def test_reducer_tolerates_mbh_telemetry():
     """HIGH regression: mbh_driver emits reject/restart/duplicate without scs.
     apply_event_to_archive must skip those cleanly instead of KeyError'ing."""
@@ -240,6 +278,7 @@ def main():
     test_basin_tabu_decay_and_reset()
     test_driver_smoke_produces_parseable_events()
     test_reducer_tolerates_mbh_telemetry()
+    test_reducer_can_rebuild_archive_from_mbh_log()
     print("\nALL PASS")
 
 

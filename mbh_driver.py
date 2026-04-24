@@ -375,6 +375,10 @@ def run(cfg: DriverConfig) -> dict:
     R_inc = float(geom.mec(scs_inc))
     archive.consider(scs_inc, R_inc, trial=-1, label="incumbent")
     best_score = R_inc
+    # Arm basin_tabu with the incumbent's signature immediately. Otherwise the
+    # first revisit of the seeded basin slips through (the seed was inserted
+    # via archive.consider, which doesn't go through the driver's basin_tabu).
+    basin_tabu.note(_basin_signature(scs_inc), is_dup=False)
 
     # Event log + periodic snapshotter.
     events_fd = ar.open_append_fd(cfg.events_path)
@@ -634,23 +638,32 @@ def run(cfg: DriverConfig) -> dict:
         event = archive.consider(
             scs_final, score_final, trial=trial, label=res.move_type
         )
-        is_new = event is not None
-        is_dup = not is_new  # duplicate at archive level == same basin
+        # archive.consider actions:
+        #   None         → same basin, not better than existing: duplicate
+        #   "replace"    → same basin, but better score: NOT a new basin
+        #   "insert"     → truly new basin
+        action = event["action"] if event is not None else "duplicate"
+        is_new_basin = action == "insert"
+        is_dup = not is_new_basin  # replace OR duplicate both hit the same basin
         basin_tabu.note(candidate_sig, is_dup=is_dup)
         tabu.note_move(move_key, is_dup=is_dup)
 
-        if is_new:
+        if is_new_basin:
             stats["accepts"] += 1
             stats["since_insert"] = 0
             tabu.on_accept_new_basin()
             if score_final < best_score:
                 best_score = score_final
+            # Accept events carry scs + label so archive_reducer.replay can
+            # rebuild archive state from the log (HIGH regression from round 4).
             ar.append_event(
                 events_fd,
                 {
                     "type": "accept",
                     "trial": trial,
                     "score": score_final,
+                    "scs": scs_final.tolist(),
+                    "label": res.move_type,
                     "move": res.move_type,
                     "D": res.D,
                     "before_size": before_size,
@@ -659,10 +672,13 @@ def run(cfg: DriverConfig) -> dict:
             )
         else:
             stats["since_insert"] += 1
+            # Same-basin improvements ("replace") still update best_score.
+            if action == "replace" and score_final < best_score:
+                best_score = score_final
             ar.append_event(
                 events_fd,
                 {
-                    "type": "duplicate",
+                    "type": action,  # "duplicate" or "replace"
                     "trial": trial,
                     "score": score_final,
                     "move": res.move_type,
