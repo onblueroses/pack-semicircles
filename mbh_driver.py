@@ -408,8 +408,9 @@ def run(cfg: DriverConfig) -> dict:
         # 4. fsync parent dir so the rename itself is durable.
         os.fdatasync(events_fd)
         payload = archive.payload("mbh", best_score)
-        payload["iters"] = stats["iters"]
-        payload["accepts"] = stats["accepts"]
+        # Surface all iter counters so unattended monitoring can distinguish
+        # a healthy run from one churning on stage_a/resolve failures.
+        payload.update(stats)
         tmp = snap_path.with_suffix(snap_path.suffix + ".tmp")
         tmp.parent.mkdir(parents=True, exist_ok=True)
         with open(tmp, "w") as f:
