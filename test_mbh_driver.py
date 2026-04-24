@@ -9,6 +9,7 @@ Covers the three HIGH findings codex caught (so regressions fail loud):
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -249,6 +250,56 @@ def test_reducer_can_rebuild_archive_from_mbh_log():
         )
 
 
+def test_replay_preserves_same_basin_improvement():
+    """Regression (codex round 5): replace events mutate archive (lower score
+    in same basin) and must therefore be replayable — i.e. carry scs+label.
+    Before this fix, replay_best_score lagged live_best_score for replaces."""
+    import archive_reducer as ar
+    import basin_archive
+    import geom
+
+    scs = load_incumbent()
+    score_hi = float(geom.mec(scs))
+    score_lo = score_hi - 1e-4
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "events.jsonl"
+        fd = ar.open_append_fd(path)
+        # Live path: insert + same-basin improvement (carries scs per our fix)
+        ar.append_event(
+            fd,
+            {
+                "type": "accept",
+                "trial": 1,
+                "score": score_hi,
+                "scs": scs.tolist(),
+                "label": "seed",
+            },
+        )
+        ar.append_event(
+            fd,
+            {
+                "type": "replace",
+                "trial": 2,
+                "score": score_lo,
+                "scs": scs.tolist(),
+                "label": "improved",
+                "move": "flip_one",
+                "D": 1.0,
+            },
+        )
+        os.close(fd)
+
+        arch = basin_archive.BasinArchive(slots=8, min_l2=0.08)
+        ar.replay_archive_events(path, lambda ev: ar.apply_event_to_archive(arch, ev))
+        assert arch.size() == 1, f"expected 1 basin, got {arch.size()}"
+        assert abs(arch.entries[0]["score"] - score_lo) < 1e-10, (
+            f"replay didn't apply improvement: score={arch.entries[0]['score']} "
+            f"expected {score_lo}"
+        )
+        print("OK: replay applies same-basin improvement (replace event)")
+
+
 def test_reducer_tolerates_mbh_telemetry():
     """HIGH regression: mbh_driver emits reject/restart/duplicate without scs.
     apply_event_to_archive must skip those cleanly instead of KeyError'ing."""
@@ -279,6 +330,7 @@ def main():
     test_driver_smoke_produces_parseable_events()
     test_reducer_tolerates_mbh_telemetry()
     test_reducer_can_rebuild_archive_from_mbh_log()
+    test_replay_preserves_same_basin_improvement()
     print("\nALL PASS")
 
 

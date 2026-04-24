@@ -675,16 +675,20 @@ def run(cfg: DriverConfig) -> dict:
             # Same-basin improvements ("replace") still update best_score.
             if action == "replace" and score_final < best_score:
                 best_score = score_final
-            ar.append_event(
-                events_fd,
-                {
-                    "type": action,  # "duplicate" or "replace"
-                    "trial": trial,
-                    "score": score_final,
-                    "move": res.move_type,
-                    "D": res.D,
-                },
-            )
+            ev = {
+                "type": action,  # "duplicate" or "replace"
+                "trial": trial,
+                "score": score_final,
+                "move": res.move_type,
+                "D": res.D,
+            }
+            # replace events mutate archive state (better score in existing
+            # basin). They must carry scs+label so reducer replay stays
+            # faithful. duplicate events don't mutate state — scs optional.
+            if action == "replace":
+                ev["scs"] = scs_final.tolist()
+                ev["label"] = res.move_type
+            ar.append_event(events_fd, ev)
 
         now = time.time()
         if now - last_snap >= cfg.snapshot_every_s:
