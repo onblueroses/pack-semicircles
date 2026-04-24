@@ -15,22 +15,32 @@ BEST_FILE = "semicircle_best.json"
 SOLUTION_FILE = "solution.json"
 
 
+def _round_validate_and_score(scs):
+    rounded = geom.rnd(np.asarray(scs, dtype=np.float64))
+    if geom.cnt(rounded) > 0:
+        return None, None
+    return float(geom.mec(rounded)), rounded
+
+
 def load_best():
     """Read best solution from pool/best.json -> semicircle_best.json -> solution.json.
 
-    Returns (score, scs) or (None, None). Matches hetero_optimizer.pool_read_best.
+    Returns (score, scs) or (None, None).
+    Re-scores from coordinates rather than trusting persisted score fields.
     """
     for path in [os.path.join(POOL_DIR, "best.json"), BEST_FILE, SOLUTION_FILE]:
         try:
             with open(path) as f:
                 data = json.load(f)
             if isinstance(data, dict) and "scs" in data:
-                scs = np.array(data["scs"])
-                return float(data["score"]), scs
+                score, scs = _round_validate_and_score(data["scs"])
+                if score is not None:
+                    return score, scs
             if isinstance(data, list):
-                scs = np.array([[s["x"], s["y"], s["theta"]] for s in data])
-                if geom.cnt(scs) == 0:
-                    return float(geom.mec(scs)), scs
+                scs = [[s["x"], s["y"], s["theta"]] for s in data]
+                score, rounded = _round_validate_and_score(scs)
+                if score is not None:
+                    return score, rounded
         except Exception:
             continue
     return None, None
@@ -42,16 +52,17 @@ def save_named_best(name, score, scs_rounded):
     name: short identifier (e.g., 'contact', 'md', 'structured').
     scs_rounded: (N,3) array already passed through geom.rnd.
     """
-    if geom.cnt(scs_rounded) > 0:
+    exact_score, rounded = _round_validate_and_score(scs_rounded)
+    if exact_score is None or rounded is None:
         return False
     data = {
-        "score": float(score),
-        "scs": scs_rounded.tolist(),
+        "score": exact_score,
+        "scs": rounded.tolist(),
         "solution": [
             {
-                "x": float(scs_rounded[i, 0]),
-                "y": float(scs_rounded[i, 1]),
-                "theta": float(scs_rounded[i, 2]),
+                "x": float(rounded[i, 0]),
+                "y": float(rounded[i, 1]),
+                "theta": float(rounded[i, 2]),
             }
             for i in range(geom.N)
         ],
@@ -61,6 +72,15 @@ def save_named_best(name, score, scs_rounded):
     with open(tmp, "w") as f:
         json.dump(data, f)
     os.replace(tmp, dst)
+    return True
+
+
+def write_json_atomic(path, data):
+    """Atomically write JSON payload to an arbitrary path."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
     return True
 
 

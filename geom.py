@@ -1,7 +1,8 @@
 """Numba-jit geometry primitives for semicircle packing.
 
-Copied verbatim from hetero_optimizer.py - bit-for-bit compatible with verify.mjs.
-Do not modify kernels without re-running the verify.mjs cross-check.
+Overlap checks mirror the challenge thresholds. MEC scoring uses the same
+high-level path as the official scorer: a sampled Welzl seed followed by
+analytic farthest-boundary refinement.
 """
 
 import math
@@ -10,7 +11,17 @@ import numba as nb
 
 N = 15
 
-__all__ = ["N", "ov", "cnt", "chk", "welzl_mec", "mec", "find_boundary_mask", "rnd"]
+__all__ = [
+    "N",
+    "ov",
+    "cnt",
+    "chk",
+    "welzl_mec",
+    "mec",
+    "mec_info",
+    "find_boundary_mask",
+    "rnd",
+]
 
 
 @nb.njit(cache=True)
@@ -181,11 +192,42 @@ def welzl_mec(px, py, k):
 
 
 @nb.njit(cache=True)
-def mec(scs):
-    """MEC radius via Welzl on boundary sample points (matches official scorer)."""
+def farthest_boundary_point(x, y, th, qx, qy):
+    """Return the boundary point of a unit semicircle farthest from (qx, qy)."""
+    best_x = x + math.cos(th - math.pi / 2)
+    best_y = y + math.sin(th - math.pi / 2)
+    best_d2 = (best_x - qx) ** 2 + (best_y - qy) ** 2
+
+    opt = math.atan2(y - qy, x - qx)
+    diff = math.atan2(math.sin(opt - th), math.cos(opt - th))
+    if -math.pi / 2 <= diff <= math.pi / 2:
+        px = x + math.cos(opt)
+        py = y + math.sin(opt)
+        d2 = (px - qx) ** 2 + (py - qy) ** 2
+        if d2 > best_d2:
+            best_x = px
+            best_y = py
+            best_d2 = d2
+
+    a = th + math.pi / 2
+    px = x + math.cos(a)
+    py = y + math.sin(a)
+    d2 = (px - qx) ** 2 + (py - qy) ** 2
+    if d2 > best_d2:
+        best_x = px
+        best_y = py
+        best_d2 = d2
+
+    return best_x, best_y
+
+
+@nb.njit(cache=True)
+def mec_info(scs):
+    """Return (cx, cy, r) for the refined MEC used by the official scorer."""
     n_arc = 30
     k = 0
-    M = N * (3 + n_arc + 1)
+    max_extra = N * 20
+    M = N * (3 + n_arc + 1) + max_extra
     px = np.empty(M)
     py = np.empty(M)
     for i in range(N):
@@ -206,7 +248,27 @@ def mec(scs):
             px[k] = x + math.cos(a)
             py[k] = y + math.sin(a)
             k += 1
-    _, _2, r = welzl_mec(px, py, k)
+
+    cx, cy, r = welzl_mec(px, py, k)
+    for _ in range(20):
+        added = 0
+        for i in range(N):
+            fx, fy = farthest_boundary_point(scs[i, 0], scs[i, 1], scs[i, 2], cx, cy)
+            if math.sqrt((fx - cx) ** 2 + (fy - cy) ** 2) > r + 1e-12:
+                px[k] = fx
+                py[k] = fy
+                k += 1
+                added += 1
+        if added == 0:
+            break
+        cx, cy, r = welzl_mec(px, py, k)
+    return cx, cy, r
+
+
+@nb.njit(cache=True)
+def mec(scs):
+    """Refined MEC radius matching the official scorer's boundary checks."""
+    _, _2, r = mec_info(scs)
     return r
 
 
@@ -214,41 +276,14 @@ def mec(scs):
 def find_boundary_mask(scs):
     """Find semicircles with sample points on/near the MEC boundary.
     Returns (boolean mask, cx, cy, r)."""
-    n_arc = 30
-    k = 0
-    M = N * (3 + n_arc + 1)
-    px = np.empty(M)
-    py = np.empty(M)
-    owner = np.empty(M, dtype=np.int64)
-    for i in range(N):
-        x, y, th = scs[i, 0], scs[i, 1], scs[i, 2]
-        ct = math.cos(th)
-        st = math.sin(th)
-        px[k] = x
-        py[k] = y
-        owner[k] = i
-        k += 1
-        px[k] = x + st
-        py[k] = y - ct
-        owner[k] = i
-        k += 1
-        px[k] = x - st
-        py[k] = y + ct
-        owner[k] = i
-        k += 1
-        for j in range(n_arc + 1):
-            a = th - math.pi / 2 + math.pi * j / n_arc
-            px[k] = x + math.cos(a)
-            py[k] = y + math.sin(a)
-            owner[k] = i
-            k += 1
-    cx, cy, r = welzl_mec(px, py, k)
+    cx, cy, r = mec_info(scs)
     mask = np.zeros(N, dtype=np.bool_)
     eps = 0.01
-    for i in range(k):
-        dist = math.sqrt((px[i] - cx) ** 2 + (py[i] - cy) ** 2)
+    for i in range(N):
+        fx, fy = farthest_boundary_point(scs[i, 0], scs[i, 1], scs[i, 2], cx, cy)
+        dist = math.sqrt((fx - cx) ** 2 + (fy - cy) ** 2)
         if dist > r - eps:
-            mask[owner[i]] = True
+            mask[i] = True
     return mask, cx, cy, r
 
 
