@@ -459,6 +459,191 @@ def move_contact_surgery(
     )
 
 
+# ---------- move: contact-surgery-2 (two-piece simultaneous removal) ----------
+#
+# Single-piece contact_surgery hits the wall on dense incumbents because the
+# packing is too tight to accept a single reseat (probe: 0/15 strictly feasible,
+# 7/15 near-feasible at -0.05 tol). Removing TWO pieces at once opens enough
+# slack: the 2-piece "vacancy" gives the placed pieces room to find feasible
+# poses without having to push any third piece out.
+#
+# Algorithm (scoped to keep cost reasonable):
+#   1. Sample one random unordered pair (p1, p2)
+#   2. Generate analytic candidates for p1 using the 13 frozen anchors (p2 absent)
+#   3. Take top-K p1 placements by min_slack
+#   4. For each top p1, fix it and generate candidates for p2 using {13 frozen + p1}
+#   5. Pick the joint placement with max joint min_slack
+#   6. Local resolve over {p1, p2, old neighbors of both, new anchors of both}
+
+CS2_TOP_K = 3  # how many p1 placements to try
+CS2_TOL = -0.05
+
+
+def _gen_candidates(
+    scs: np.ndarray,
+    excluded: set[int],
+    cx: float,
+    cy: float,
+    mec_r: float,
+) -> list[tuple[float, float, list]]:
+    """Generate analytic tangency candidate centers using all pieces NOT in
+    `excluded`. Returns deduped, MEC-inside list of (qx, qy, anchor_list)."""
+    anchors = [j for j in range(geom.N) if j not in excluded]
+    cands: list[tuple[float, float, list]] = []
+    for ii, i in enumerate(anchors):
+        for j in anchors[ii + 1 :]:
+            for x, y in _circle_circle_intersect(
+                scs[i, 0], scs[i, 1], 2.0, scs[j, 0], scs[j, 1], 2.0
+            ):
+                cands.append((x, y, [i, j]))
+    for i in anchors:
+        for x, y in _circle_circle_intersect(
+            scs[i, 0], scs[i, 1], 2.0, cx, cy, mec_r - 1.0
+        ):
+            cands.append((x, y, [i, "rim"]))
+    uniq: list[tuple[float, float, list]] = []
+    for c in cands:
+        if any(math.hypot(c[0] - u[0], c[1] - u[1]) < 1e-4 for u in uniq):
+            continue
+        uniq.append(c)
+    return [c for c in uniq if math.hypot(c[0] - cx, c[1] - cy) <= mec_r - 1.0 + 1e-3]
+
+
+def _best_pose_at(
+    scs: np.ndarray,
+    candidates: list[tuple[float, float, list]],
+    against_idx: list[int],
+    cx: float,
+    cy: float,
+    R: float,
+    tol: float,
+    top_k: int = 1,
+) -> list[tuple[float, tuple[float, float, float], list]]:
+    """For each candidate, sweep theta; collect placements with min_slack >= tol
+    against pieces in `against_idx` and rim containment. Return top_k by slack."""
+    out: list[tuple[float, tuple[float, float, float], list]] = []
+    for qx, qy, anchors in candidates:
+        for k in range(CONTACT_SURGERY_THETA_GRID):
+            theta = 2.0 * math.pi * k / CONTACT_SURGERY_THETA_GRID
+            ms = float("inf")
+            ok = True
+            for j in against_idx:
+                g = gapmod.gap_ss(qx, qy, theta, scs[j, 0], scs[j, 1], scs[j, 2])
+                if g < ms:
+                    ms = g
+                if ms < tol:
+                    ok = False
+                    break
+            if not ok:
+                continue
+            cg = attack4.contain_gap_exact(qx, qy, theta, cx, cy, R)
+            ms = min(ms, cg)
+            if ms < tol:
+                continue
+            out.append((ms, (qx, qy, theta), anchors))
+    out.sort(key=lambda r: -r[0])
+    return out[:top_k]
+
+
+def move_contact_surgery_2(
+    scs: np.ndarray, R: float, rng: np.random.Generator
+) -> PerturbResult:
+    """Two-piece contact surgery: remove (p1, p2), place both via analytic
+    tangency, local-resolve over the active set. Topology-changing.
+
+    Pre-resolved: True. Fallback preserves move_type='contact_surgery_2'.
+    """
+    cx, cy, mec_r = geom.mec_info(scs)
+    pair = rng.choice(geom.N, size=2, replace=False)
+    p1, p2 = int(pair[0]), int(pair[1])
+    others_13 = [j for j in range(geom.N) if j not in (p1, p2)]
+
+    # Step 1: candidates for p1 ignoring p2
+    cands_p1 = _gen_candidates(scs, {p1, p2}, cx, cy, mec_r)
+    top_p1 = _best_pose_at(scs, cands_p1, others_13, cx, cy, R, CS2_TOL, CS2_TOP_K)
+
+    if not top_p1:
+        return PerturbResult(
+            scs.copy(),
+            "contact_surgery_2",
+            0.0,
+            {
+                "pieces": [p1, p2],
+                "fallback": "no_p1_pose",
+                "n_p1_candidates": len(cands_p1),
+                "pre_resolved": False,
+            },
+        )
+
+    # Step 2: for each top p1, find best p2 placement in {others_13 ∪ p1}
+    best_joint: (
+        tuple[float, tuple[float, float, float], tuple[float, float, float], list, list]
+        | None
+    ) = None
+    for ms_p1, pose_p1, anchors_p1 in top_p1:
+        scs_with_p1 = scs.copy()
+        scs_with_p1[p1] = pose_p1
+        cands_p2 = _gen_candidates(scs_with_p1, {p2}, cx, cy, mec_r)
+        against_p2 = others_13 + [p1]
+        top_p2 = _best_pose_at(
+            scs_with_p1, cands_p2, against_p2, cx, cy, R, CS2_TOL, top_k=1
+        )
+        if not top_p2:
+            continue
+        ms_p2, pose_p2, anchors_p2 = top_p2[0]
+        joint_ms = min(ms_p1, ms_p2)
+        if best_joint is None or joint_ms > best_joint[0]:
+            best_joint = (joint_ms, pose_p1, pose_p2, anchors_p1, anchors_p2)
+
+    if best_joint is None:
+        return PerturbResult(
+            scs.copy(),
+            "contact_surgery_2",
+            0.0,
+            {
+                "pieces": [p1, p2],
+                "fallback": "no_p2_pose",
+                "n_p1_candidates": len(cands_p1),
+                "pre_resolved": False,
+            },
+        )
+
+    joint_ms, pose_p1, pose_p2, anchors_p1, anchors_p2 = best_joint
+    placed = scs.copy()
+    placed[p1] = pose_p1
+    placed[p2] = pose_p2
+
+    # Build active set: both placed pieces, their old neighbors, their analytic anchors
+    pair_contacts, _, _ = _contacts_and_witnesses(scs, cx, cy, R)
+    old_n1 = {b for a, b in pair_contacts if a == p1} | {
+        a for a, b in pair_contacts if b == p1
+    }
+    old_n2 = {b for a, b in pair_contacts if a == p2} | {
+        a for a, b in pair_contacts if b == p2
+    }
+    new_n1 = {a for a in anchors_p1 if isinstance(a, int)}
+    new_n2 = {a for a in anchors_p2 if isinstance(a, int)}
+    active = {p1, p2} | old_n1 | old_n2 | new_n1 | new_n2
+
+    R_res = R + CONTACT_SURGERY_R_RESOLVE_SLACK
+    resolved, pen = _local_resolve(placed, active, cx, cy, R_res)
+    D = weighted_d(scs, resolved, R)
+    return PerturbResult(
+        resolved,
+        "contact_surgery_2",
+        D,
+        {
+            "pieces": [p1, p2],
+            "anchors_p1": [a if isinstance(a, str) else int(a) for a in anchors_p1],
+            "anchors_p2": [a if isinstance(a, str) else int(a) for a in anchors_p2],
+            "active_size": len(active),
+            "joint_min_slack": float(joint_ms),
+            "local_resolve_penalty": float(pen),
+            "pre_resolved": True,
+        },
+    )
+
+
 # ---------- scheduler ----------
 
 
@@ -468,13 +653,15 @@ MOVES = {
     "rim_swap": move_rim_swap,
     "rotate_cluster": move_rotate_cluster,
     "contact_surgery": move_contact_surgery,
+    "contact_surgery_2": move_contact_surgery_2,
 }
 DEFAULT_WEIGHTS = {
-    "flip_one": 0.27,
-    "reseat_interior": 0.23,
-    "rim_swap": 0.18,
-    "rotate_cluster": 0.22,
-    "contact_surgery": 0.10,
+    "flip_one": 0.25,
+    "reseat_interior": 0.21,
+    "rim_swap": 0.17,
+    "rotate_cluster": 0.20,
+    "contact_surgery": 0.09,
+    "contact_surgery_2": 0.08,
 }
 
 
