@@ -122,12 +122,43 @@ def test_scheduler_in_band_acceptance():
     assert rate >= 0.4, f"in-band rate too low: {rate:.2f}"
 
 
+def test_contact_surgery_pre_resolved_flag():
+    """Non-fallback contact_surgery results carry pre_resolved=True so the
+    driver knows to skip its global resolve. Fallback path keeps move_type
+    intact (per Codex P3 — fallback must not masquerade as another move)."""
+    scs, _ = load_incumbent()
+    R = 2.9486936795
+    rng = np.random.default_rng(13)
+    n_real, n_fallback = 0, 0
+    for _ in range(30):
+        res = pl.move_contact_surgery(scs, R, rng)
+        assert res.move_type == "contact_surgery", (
+            f"fallback masqueraded as {res.move_type}"
+        )
+        if res.metadata.get("fallback"):
+            n_fallback += 1
+            assert not res.metadata.get("pre_resolved", False)
+            assert res.D == 0.0
+        else:
+            n_real += 1
+            assert res.metadata.get("pre_resolved") is True
+            assert res.D > 0
+            assert "active_size" in res.metadata
+    assert n_real >= 5, (
+        f"contact_surgery produced only {n_real}/30 real moves (rest fallbacks). "
+        "Move is dead for this incumbent — relax CONTACT_SURGERY_TOL or extend "
+        "tangency constructions."
+    )
+    print(f"OK: contact_surgery: {n_real} real / {n_fallback} fallback in 30 samples")
+
+
 def main():
     t0 = time.time()
     test_moves_produce_nonzero_d()
     test_weighted_d_zero_on_identity()
     test_distribution()
     test_scheduler_in_band_acceptance()
+    test_contact_surgery_pre_resolved_flag()
     print(f"\nALL PASS ({time.time() - t0:.1f}s)")
 
 

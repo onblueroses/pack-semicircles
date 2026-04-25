@@ -508,14 +508,22 @@ def run(cfg: DriverConfig) -> dict:
             continue
 
         # ---- resolve + Stage A
+        # Topology-changing moves (contact_surgery) carry pre_resolved=True and
+        # have already run a LOCAL resolve over piece+neighbors; running global
+        # resolve_overlap on top scrambles the deliberate topology change back
+        # into the original basin (Codex P1). Skip directly to Stage A.
         cx_before, cy_before, _ = geom.mec_info(current)
-        scs_resolved, pen, worst_gap, ok = resolve_overlap(
-            res.scs,
-            cx_before,
-            cy_before,
-            R_resolve,
-            max_deficit=cfg.resolve_max_deficit,
-        )
+        if res.metadata.get("pre_resolved"):
+            scs_resolved = res.scs
+            pen, worst_gap, ok = 0.0, 0.0, True
+        else:
+            scs_resolved, pen, worst_gap, ok = resolve_overlap(
+                res.scs,
+                cx_before,
+                cy_before,
+                R_resolve,
+                max_deficit=cfg.resolve_max_deficit,
+            )
         if not ok:
             stats["resolve_failed"] += 1
             stats["since_insert"] += 1
