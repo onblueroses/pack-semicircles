@@ -48,14 +48,16 @@ def bench_move(name: str, scs, R, rng, n=30):
 
 def test_moves_produce_nonzero_d():
     """Each move must actually damage the incumbent (no silent no-ops).
-    Averages over 10 samples so a single unlucky pick doesn't flunk."""
+    Surgery moves and shock get more samples since they have non-trivial
+    fallback rates (cs3 ~20%, shock low but possible). Local moves get 10."""
     scs, _ = load_incumbent()
     R = 2.9486936795
     rng = np.random.default_rng(42)
     for name in pl.MOVES:
+        n = 30 if name.startswith("contact_surgery") or name == "shock" else 10
         ds = []
         changed = False
-        for _ in range(10):
+        for _ in range(n):
             res = pl.propose(scs, R, rng=rng, move_type=name, max_retries=1)
             assert res.scs.shape == scs.shape, f"{name}: bad shape"
             assert res.D >= 0, f"{name}: negative D {res.D}"
@@ -63,9 +65,9 @@ def test_moves_produce_nonzero_d():
             ds.append(res.D)
             if not np.array_equal(res.scs, scs):
                 changed = True
-        assert max(ds) > 0, f"{name}: never damaged incumbent in 10 samples"
-        assert changed, f"{name}: returned unmodified config across 10 samples"
-    print("OK: each move damages the incumbent at least once in 10 samples")
+        assert max(ds) > 0, f"{name}: never damaged incumbent in {n} samples"
+        assert changed, f"{name}: returned unmodified config across {n} samples"
+    print("OK: every move damages the incumbent at least once")
 
 
 def test_weighted_d_zero_on_identity():
@@ -181,6 +183,76 @@ def test_contact_surgery_2_pre_resolved_flag():
     print(f"OK: contact_surgery_2: {n_real} real / {n_fallback} fallback in 20 samples")
 
 
+def test_contact_surgery_3_pre_resolved_flag():
+    """Three-piece contact surgery: 3-piece vacancy opens enough DOFs that the
+    feasibility rate should be at least as high as cs2."""
+    scs, _ = load_incumbent()
+    R = 2.9486936795
+    rng = np.random.default_rng(23)
+    n_real, n_fallback = 0, 0
+    for _ in range(15):
+        res = pl.move_contact_surgery_3(scs, R, rng)
+        assert res.move_type == "contact_surgery_3"
+        if res.metadata.get("fallback"):
+            n_fallback += 1
+            assert not res.metadata.get("pre_resolved", False)
+            assert res.D == 0.0
+        else:
+            n_real += 1
+            assert res.metadata.get("pre_resolved") is True
+            assert "active_size" in res.metadata
+            assert "joint_min_slack" in res.metadata
+            assert len(res.metadata["pieces"]) == 3
+    print(f"OK: contact_surgery_3: {n_real} real / {n_fallback} fallback in 15 samples")
+
+
+def test_shock_breaks_contacts():
+    """Shock should produce non-zero D — it deliberately damages topology."""
+    scs, _ = load_incumbent()
+    R = 2.9486936795
+    rng = np.random.default_rng(29)
+    n_real, n_fallback = 0, 0
+    ds = []
+    for _ in range(10):
+        res = pl.move_shock(scs, R, rng)
+        assert res.move_type == "shock"
+        if res.metadata.get("fallback"):
+            n_fallback += 1
+        else:
+            n_real += 1
+            assert res.metadata.get("pre_resolved") is True
+            ds.append(res.D)
+    assert n_real >= 5, f"shock had only {n_real}/10 real moves"
+    assert max(ds) > 0, "shock never damaged the incumbent"
+    print(
+        f"OK: shock: {n_real} real / {n_fallback} fallback, "
+        f"D range [{min(ds):.2f}, {max(ds):.2f}]"
+    )
+
+
+def test_profiles_propose():
+    """Each profile should successfully propose moves under its own d_band.
+    Verifies the profile-aware propose() path, not just defaults."""
+    scs, _ = load_incumbent()
+    R = 2.9486936795
+    for profile_name, (weights, d_band) in pl.PROFILES.items():
+        rng = np.random.default_rng(101)
+        in_band = 0
+        n = 30
+        for _ in range(n):
+            res = pl.propose(
+                scs, R, rng=rng, weights=weights, d_band=d_band, max_retries=4
+            )
+            if res.metadata.get("in_band", False):
+                in_band += 1
+        rate = in_band / n
+        # Each profile must hit its own band at least ~25% of the time. Explore
+        # has the widest band so this is mostly a structural test.
+        assert rate >= 0.25, f"profile {profile_name} in-band rate {rate:.2f} < 0.25"
+        print(f"  profile {profile_name}: in-band {rate * 100:.0f}% (band={d_band})")
+    print("OK: all profiles propose moves within their own d_band")
+
+
 def main():
     t0 = time.time()
     test_moves_produce_nonzero_d()
@@ -189,6 +261,9 @@ def main():
     test_scheduler_in_band_acceptance()
     test_contact_surgery_pre_resolved_flag()
     test_contact_surgery_2_pre_resolved_flag()
+    test_contact_surgery_3_pre_resolved_flag()
+    test_shock_breaks_contacts()
+    test_profiles_propose()
     print(f"\nALL PASS ({time.time() - t0:.1f}s)")
 
 

@@ -361,6 +361,10 @@ class DriverConfig:
     stage_a_maxiter: int = 60
     stop_flag: str = ""
     snapshot_every_s: float = 30.0
+    # Move-mix profile: "default" | "explore" | "exploit". Explore widens
+    # D-band and shifts weight to topology-changing moves (cs/cs2/cs3/shock);
+    # exploit narrows D-band and emphasises local refinement. See pl.PROFILES.
+    profile: str = "default"
 
 
 def run(cfg: DriverConfig) -> dict:
@@ -461,8 +465,14 @@ def run(cfg: DriverConfig) -> dict:
 
     R_resolve = cfg.R_target + cfg.R_resolve_slack
     current_idx = 0  # rank in archive to use as current
+    if cfg.profile not in pl.PROFILES:
+        raise ValueError(
+            f"unknown profile {cfg.profile!r}; expected one of {list(pl.PROFILES.keys())}"
+        )
+    profile_weights, profile_d_band = pl.PROFILES[cfg.profile]
     print(
-        f"[mbh] start R_target={cfg.R_target} R_resolve={R_resolve} hours={cfg.hours}"
+        f"[mbh] start R_target={cfg.R_target} R_resolve={R_resolve} hours={cfg.hours} "
+        f"profile={cfg.profile} d_band={profile_d_band}"
     )
 
     while not _time_up():
@@ -490,7 +500,14 @@ def run(cfg: DriverConfig) -> dict:
         current = archive.entries[cur_idx]["scs"]
 
         # ---- perturb
-        res = pl.propose(current, cfg.R_target, rng=rng, max_retries=6)
+        res = pl.propose(
+            current,
+            cfg.R_target,
+            rng=rng,
+            weights=profile_weights,
+            d_band=profile_d_band,
+            max_retries=6,
+        )
         move_key = _move_key(res)
         if tabu.hit_move(move_key):
             stats["tabu_skips"] += 1
@@ -742,6 +759,12 @@ def main():
     ap.add_argument("--max-iters", type=int, default=None)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--stop-flag", default="")
+    ap.add_argument(
+        "--profile",
+        default="default",
+        choices=["default", "explore", "exploit"],
+        help="move-mix profile (explore=topology-heavy, exploit=local-heavy)",
+    )
     args = ap.parse_args()
 
     Path(args.events).parent.mkdir(parents=True, exist_ok=True)
@@ -754,6 +777,7 @@ def main():
         max_iters=args.max_iters,
         seed=args.seed,
         stop_flag=args.stop_flag,
+        profile=args.profile,
     )
     summary = run(cfg)
     return summary

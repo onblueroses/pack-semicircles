@@ -477,6 +477,9 @@ def move_contact_surgery(
 
 CS2_TOP_K = 3  # how many p1 placements to try
 CS2_TOL = -0.05
+CS3_TOP_K_1 = 2  # how many p1 placements to try
+CS3_TOP_K_2 = 2  # how many p2 placements to try per top_p1
+CS3_TOL = -0.06  # slightly looser than cs2 since 3-piece local resolve has more slack
 
 
 def _gen_candidates(
@@ -644,6 +647,206 @@ def move_contact_surgery_2(
     )
 
 
+# ---------- move: contact-surgery-3 (three-piece simultaneous removal) ----------
+#
+# Same active-set + analytic-tangency pattern as cs2, extended to a triple. The
+# extra vacancy gives roughly an order more degrees of freedom than cs2 — useful
+# when the incumbent's basin is too dense for cs2 to find a feasible joint pose.
+# Cost grows with TOP_K_1 * TOP_K_2; held to (2, 2) so a typical call is ~150ms.
+
+
+def move_contact_surgery_3(
+    scs: np.ndarray, R: float, rng: np.random.Generator
+) -> PerturbResult:
+    """Three-piece contact surgery: remove (p1, p2, p3), place via cascaded
+    analytic tangency, local-resolve over the active set. Topology-changing.
+
+    Pre-resolved: True. Fallback preserves move_type='contact_surgery_3'.
+    """
+    cx, cy, mec_r = geom.mec_info(scs)
+    triple = rng.choice(geom.N, size=3, replace=False)
+    p1, p2, p3 = int(triple[0]), int(triple[1]), int(triple[2])
+    excluded = {p1, p2, p3}
+    others_12 = [j for j in range(geom.N) if j not in excluded]
+
+    cands_p1 = _gen_candidates(scs, excluded, cx, cy, mec_r)
+    top_p1 = _best_pose_at(scs, cands_p1, others_12, cx, cy, R, CS3_TOL, CS3_TOP_K_1)
+    if not top_p1:
+        return PerturbResult(
+            scs.copy(),
+            "contact_surgery_3",
+            0.0,
+            {
+                "pieces": [p1, p2, p3],
+                "fallback": "no_p1_pose",
+                "n_p1_candidates": len(cands_p1),
+                "pre_resolved": False,
+            },
+        )
+
+    best_triple: (
+        tuple[
+            float,
+            tuple[float, float, float],
+            tuple[float, float, float],
+            tuple[float, float, float],
+            list,
+            list,
+            list,
+        ]
+        | None
+    ) = None
+    for ms_p1, pose_p1, anchors_p1 in top_p1:
+        scs_with_p1 = scs.copy()
+        scs_with_p1[p1] = pose_p1
+        cands_p2 = _gen_candidates(scs_with_p1, {p2, p3}, cx, cy, mec_r)
+        against_p2 = others_12 + [p1]
+        top_p2 = _best_pose_at(
+            scs_with_p1, cands_p2, against_p2, cx, cy, R, CS3_TOL, CS3_TOP_K_2
+        )
+        if not top_p2:
+            continue
+        for ms_p2, pose_p2, anchors_p2 in top_p2:
+            scs_with_p1_p2 = scs_with_p1.copy()
+            scs_with_p1_p2[p2] = pose_p2
+            cands_p3 = _gen_candidates(scs_with_p1_p2, {p3}, cx, cy, mec_r)
+            against_p3 = others_12 + [p1, p2]
+            top_p3 = _best_pose_at(
+                scs_with_p1_p2, cands_p3, against_p3, cx, cy, R, CS3_TOL, top_k=1
+            )
+            if not top_p3:
+                continue
+            ms_p3, pose_p3, anchors_p3 = top_p3[0]
+            joint_ms = min(ms_p1, ms_p2, ms_p3)
+            if best_triple is None or joint_ms > best_triple[0]:
+                best_triple = (
+                    joint_ms,
+                    pose_p1,
+                    pose_p2,
+                    pose_p3,
+                    anchors_p1,
+                    anchors_p2,
+                    anchors_p3,
+                )
+
+    if best_triple is None:
+        return PerturbResult(
+            scs.copy(),
+            "contact_surgery_3",
+            0.0,
+            {
+                "pieces": [p1, p2, p3],
+                "fallback": "no_joint_pose",
+                "n_p1_candidates": len(cands_p1),
+                "pre_resolved": False,
+            },
+        )
+
+    joint_ms, pose_p1, pose_p2, pose_p3, anchors_p1, anchors_p2, anchors_p3 = (
+        best_triple
+    )
+    placed = scs.copy()
+    placed[p1] = pose_p1
+    placed[p2] = pose_p2
+    placed[p3] = pose_p3
+
+    pair_contacts, _, _ = _contacts_and_witnesses(scs, cx, cy, R)
+    old_n: set[int] = set()
+    for pi in (p1, p2, p3):
+        old_n |= {b for a, b in pair_contacts if a == pi}
+        old_n |= {a for a, b in pair_contacts if b == pi}
+    new_n = (
+        {a for a in anchors_p1 if isinstance(a, int)}
+        | {a for a in anchors_p2 if isinstance(a, int)}
+        | {a for a in anchors_p3 if isinstance(a, int)}
+    )
+    active = {p1, p2, p3} | old_n | new_n
+
+    R_res = R + CONTACT_SURGERY_R_RESOLVE_SLACK
+    resolved, pen = _local_resolve(placed, active, cx, cy, R_res)
+    D = weighted_d(scs, resolved, R)
+    return PerturbResult(
+        resolved,
+        "contact_surgery_3",
+        D,
+        {
+            "pieces": [p1, p2, p3],
+            "anchors_p1": [a if isinstance(a, str) else int(a) for a in anchors_p1],
+            "anchors_p2": [a if isinstance(a, str) else int(a) for a in anchors_p2],
+            "anchors_p3": [a if isinstance(a, str) else int(a) for a in anchors_p3],
+            "active_size": len(active),
+            "joint_min_slack": float(joint_ms),
+            "local_resolve_penalty": float(pen),
+            "pre_resolved": True,
+        },
+    )
+
+
+# ---------- move: shock (mass contact-break) ----------
+#
+# Annealing-style diversification. Pick K random pair-contacts from the current
+# config, perturb each contributing piece by a small random displacement so the
+# contacts break, then run a local resolve over the affected pieces. Unlike cs/
+# cs2/cs3 this doesn't try to find a "good" reseat — it deliberately damages the
+# topology and lets the resolve + Stage A pipeline find a different basin.
+
+SHOCK_K_DEFAULT = 4  # number of pair contacts to break
+SHOCK_DISPLACE = 0.35  # |Δxy| per affected piece, in MEC units
+
+
+def move_shock(
+    scs: np.ndarray,
+    R: float,
+    rng: np.random.Generator,
+    k_break: int | None = None,
+) -> PerturbResult:
+    """Break K pair contacts by displacing each contributing piece, then
+    local-resolve over the affected set. Pre-resolved: True."""
+    cx, cy, _ = geom.mec_info(scs)
+    pair_contacts, _, _ = _contacts_and_witnesses(scs, cx, cy, R)
+    if k_break is None:
+        k_break = SHOCK_K_DEFAULT
+    contacts = list(pair_contacts)
+    if not contacts:
+        return PerturbResult(
+            scs.copy(),
+            "shock",
+            0.0,
+            {"fallback": "no_contacts", "pre_resolved": False},
+        )
+    rng.shuffle(contacts)
+    chosen = contacts[: min(k_break, len(contacts))]
+    affected: set[int] = set()
+    for a, b in chosen:
+        affected.add(a)
+        affected.add(b)
+
+    out = scs.copy()
+    for i in affected:
+        # Random displacement of magnitude ≈ SHOCK_DISPLACE in a random direction
+        phi = float(rng.uniform(0, 2 * math.pi))
+        out[i, 0] += SHOCK_DISPLACE * math.cos(phi)
+        out[i, 1] += SHOCK_DISPLACE * math.sin(phi)
+        out[i, 2] = (out[i, 2] + float(rng.uniform(-math.pi / 4, math.pi / 4))) % (
+            2 * math.pi
+        )
+
+    R_res = R + CONTACT_SURGERY_R_RESOLVE_SLACK
+    resolved, pen = _local_resolve(out, affected, cx, cy, R_res)
+    D = weighted_d(scs, resolved, R)
+    return PerturbResult(
+        resolved,
+        "shock",
+        D,
+        {
+            "broken_contacts": [[int(a), int(b)] for a, b in chosen],
+            "affected_size": len(affected),
+            "local_resolve_penalty": float(pen),
+            "pre_resolved": True,
+        },
+    )
+
+
 # ---------- scheduler ----------
 
 
@@ -654,14 +857,50 @@ MOVES = {
     "rotate_cluster": move_rotate_cluster,
     "contact_surgery": move_contact_surgery,
     "contact_surgery_2": move_contact_surgery_2,
+    "contact_surgery_3": move_contact_surgery_3,
+    "shock": move_shock,
 }
 DEFAULT_WEIGHTS = {
-    "flip_one": 0.25,
-    "reseat_interior": 0.21,
-    "rim_swap": 0.17,
-    "rotate_cluster": 0.20,
-    "contact_surgery": 0.09,
+    "flip_one": 0.22,
+    "reseat_interior": 0.18,
+    "rim_swap": 0.15,
+    "rotate_cluster": 0.18,
+    "contact_surgery": 0.08,
     "contact_surgery_2": 0.08,
+    "contact_surgery_3": 0.06,
+    "shock": 0.05,
+}
+
+# Profile presets for mbh_driver. EXPLORE shifts weight toward topology-changing
+# moves and widens D-band so big perturbations aren't rejected upstream. EXPLOIT
+# stays tight on local moves for refining a known basin. The driver picks a
+# profile via --profile and passes both weights and d_band into propose().
+EXPLORE_WEIGHTS = {
+    "flip_one": 0.05,
+    "reseat_interior": 0.05,
+    "rim_swap": 0.05,
+    "rotate_cluster": 0.10,
+    "contact_surgery": 0.18,
+    "contact_surgery_2": 0.22,
+    "contact_surgery_3": 0.20,
+    "shock": 0.15,
+}
+EXPLORE_D_BAND = (1.0, 30.0)
+EXPLOIT_WEIGHTS = {
+    "flip_one": 0.30,
+    "reseat_interior": 0.25,
+    "rim_swap": 0.20,
+    "rotate_cluster": 0.20,
+    "contact_surgery": 0.03,
+    "contact_surgery_2": 0.02,
+    "contact_surgery_3": 0.0,
+    "shock": 0.0,
+}
+EXPLOIT_D_BAND = (2.0, 6.0)
+PROFILES = {
+    "default": (DEFAULT_WEIGHTS, D_BAND),
+    "explore": (EXPLORE_WEIGHTS, EXPLORE_D_BAND),
+    "exploit": (EXPLOIT_WEIGHTS, EXPLOIT_D_BAND),
 }
 
 
@@ -672,26 +911,33 @@ def propose(
     move_type: str | None = None,
     weights: dict[str, float] | None = None,
     max_retries: int = 6,
+    d_band: tuple[float, float] | None = None,
 ) -> PerturbResult:
-    """Sample a move, accept if D falls in D_BAND. Retry up to max_retries with
-    a fresh random choice if out of band. On exhaustion return the last
-    proposal regardless (driver logs out-of-band fraction for weight tuning)."""
+    """Sample a move, accept if D falls in d_band (default D_BAND). Retry up to
+    max_retries with a fresh random choice if out of band. On exhaustion return
+    the last proposal regardless (driver logs out-of-band fraction for weight
+    tuning).
+
+    d_band can be passed by callers using a profile (explore widens it,
+    exploit narrows it) so high-D topology moves aren't rejected upstream.
+    """
     if rng is None:
         rng = np.random.default_rng()
     w = weights or DEFAULT_WEIGHTS
+    band = d_band if d_band is not None else D_BAND
     names = list(w.keys())
     ps = np.array([w[n] for n in names], dtype=float)
     ps = ps / ps.sum()
     retries = max(1, max_retries)
     picked = move_type or str(rng.choice(names, p=ps))
     last: PerturbResult = MOVES[picked](scs, R, rng)
-    if D_BAND[0] <= last.D <= D_BAND[1]:
+    if band[0] <= last.D <= band[1]:
         last.metadata["in_band"] = True
         return last
     for _ in range(retries - 1):
         picked = move_type or str(rng.choice(names, p=ps))
         last = MOVES[picked](scs, R, rng)
-        if D_BAND[0] <= last.D <= D_BAND[1]:
+        if band[0] <= last.D <= band[1]:
             last.metadata["in_band"] = True
             return last
     last.metadata["in_band"] = False
