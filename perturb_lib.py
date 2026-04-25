@@ -834,15 +834,21 @@ def move_shock(
     R_res = R + CONTACT_SURGERY_R_RESOLVE_SLACK
     resolved, pen = _local_resolve(out, affected, cx, cy, R_res)
     D = weighted_d(scs, resolved, R)
+    # Codex P1: don't set pre_resolved — shock's random displacement isn't a
+    # near-feasible analytic seed like cs/cs2/cs3, and the local resolve often
+    # leaves overlap that exceeds the driver's resolve_max_deficit. Let the
+    # driver's global resolve_overlap repair it (or reject, which is fine).
+    # Codex P1 (tabu): include `pieces` so mbh_driver._move_key() doesn't
+    # collapse every shock proposal to a single global tabu key.
     return PerturbResult(
         resolved,
         "shock",
         D,
         {
+            "pieces": sorted(affected),
             "broken_contacts": [[int(a), int(b)] for a, b in chosen],
             "affected_size": len(affected),
             "local_resolve_penalty": float(pen),
-            "pre_resolved": True,
         },
     )
 

@@ -184,13 +184,15 @@ def test_contact_surgery_2_pre_resolved_flag():
 
 
 def test_contact_surgery_3_pre_resolved_flag():
-    """Three-piece contact surgery: 3-piece vacancy opens enough DOFs that the
-    feasibility rate should be at least as high as cs2."""
+    """Three-piece contact surgery: ~20% real-move rate on the incumbent. Use
+    a 60-sample batch across mixed seeds so the feasibility branch actually
+    gets exercised — a single bad seed (e.g. 23) hits 0/15 real moves and
+    leaves the pre_resolved branch untested (Codex P2)."""
     scs, _ = load_incumbent()
     R = 2.9486936795
-    rng = np.random.default_rng(23)
     n_real, n_fallback = 0, 0
-    for _ in range(15):
+    for seed in range(60):
+        rng = np.random.default_rng(seed)
         res = pl.move_contact_surgery_3(scs, R, rng)
         assert res.move_type == "contact_surgery_3"
         if res.metadata.get("fallback"):
@@ -203,11 +205,20 @@ def test_contact_surgery_3_pre_resolved_flag():
             assert "active_size" in res.metadata
             assert "joint_min_slack" in res.metadata
             assert len(res.metadata["pieces"]) == 3
-    print(f"OK: contact_surgery_3: {n_real} real / {n_fallback} fallback in 15 samples")
+    assert n_real >= 5, (
+        f"contact_surgery_3 produced only {n_real}/60 real moves — move is "
+        f"effectively dead for this incumbent. Loosen CS3_TOL or extend the "
+        f"tangency construction set."
+    )
+    print(f"OK: contact_surgery_3: {n_real} real / {n_fallback} fallback in 60 samples")
 
 
 def test_shock_breaks_contacts():
-    """Shock should produce non-zero D — it deliberately damages topology."""
+    """Shock deliberately damages topology. Codex P1: shock does NOT set
+    pre_resolved — the random displacement isn't a near-feasible analytic
+    seed, so the driver must run global resolve_overlap to repair (or reject).
+    Also verifies metadata['pieces'] is populated so move-tabu doesn't
+    collapse to a single global key."""
     scs, _ = load_incumbent()
     R = 2.9486936795
     rng = np.random.default_rng(29)
@@ -220,7 +231,12 @@ def test_shock_breaks_contacts():
             n_fallback += 1
         else:
             n_real += 1
-            assert res.metadata.get("pre_resolved") is True
+            assert not res.metadata.get("pre_resolved", False), (
+                "shock must NOT set pre_resolved — driver needs to run global resolve"
+            )
+            assert "pieces" in res.metadata and len(res.metadata["pieces"]) > 0, (
+                "shock must record affected pieces so move-tabu keys per-shock"
+            )
             ds.append(res.D)
     assert n_real >= 5, f"shock had only {n_real}/10 real moves"
     assert max(ds) > 0, "shock never damaged the incumbent"
