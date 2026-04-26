@@ -365,6 +365,12 @@ class DriverConfig:
     # D-band and shifts weight to topology-changing moves (cs/cs2/cs3/shock);
     # exploit narrows D-band and emphasises local refinement. See pl.PROFILES.
     profile: str = "default"
+    # Chaos pulse: every N trials, displace chaos_n_pieces random pieces by
+    # chaos_kick_xy (+/- chaos_kick_xy*0.5 in theta), global resolve, accept
+    # only if R improves. Default 0 = off. Additive; existing path unchanged.
+    chaos_pulse_every_iters: int = 0
+    chaos_kick_xy: float = 0.10
+    chaos_n_pieces: int = 4
 
 
 def run(cfg: DriverConfig) -> dict:
@@ -478,6 +484,75 @@ def run(cfg: DriverConfig) -> dict:
     while not _time_up():
         stats["iters"] += 1
         trial = stats["iters"]
+
+        # ---- chaos pulse (default off; iteration-counter trigger).
+        # Picks N pieces from archive-best, displaces xy by chaos_kick_xy and
+        # theta by +/- chaos_kick_xy*0.5, runs global resolve, accepts iff
+        # valid AND R improves over best_score. Reject path emits telemetry
+        # but never inserts — cannot poison the archive.
+        if (
+            cfg.chaos_pulse_every_iters > 0
+            and trial > 0
+            and trial % cfg.chaos_pulse_every_iters == 0
+            and archive.size() > 0
+        ):
+            base = np.asarray(archive.entries[0]["scs"], dtype=np.float64)
+            scs_chaos = base.copy()
+            n_kick = min(cfg.chaos_n_pieces, geom.N)
+            kick_idx = rng.choice(geom.N, size=n_kick, replace=False)
+            for i in kick_idx:
+                ang = rng.uniform(0.0, 2.0 * math.pi)
+                scs_chaos[i, 0] += cfg.chaos_kick_xy * math.cos(ang)
+                scs_chaos[i, 1] += cfg.chaos_kick_xy * math.sin(ang)
+                scs_chaos[i, 2] += rng.uniform(-1.0, 1.0) * cfg.chaos_kick_xy * 0.5
+            cx_c, cy_c, _ = geom.mec_info(scs_chaos)
+            scs_res, _, _, ok_res = resolve_overlap(
+                scs_chaos, cx_c, cy_c, R_resolve, max_deficit=cfg.resolve_max_deficit
+            )
+            accepted = False
+            R_chaos = None
+            if ok_res:
+                scs_round = geom.rnd(scs_res)
+                if int(geom.cnt(scs_round)) == 0:
+                    R_chaos = float(geom.mec(scs_round))
+                    if R_chaos < best_score:
+                        sig_chaos = _basin_signature(scs_round)
+                        archive.consider(
+                            scs_round, R_chaos, trial=trial, label="chaos_pulse"
+                        )
+                        basin_tabu.note(sig_chaos, is_dup=False)
+                        best_score = R_chaos
+                        stats["accepts"] += 1
+                        stats["since_insert"] = 0
+                        ar.append_event(
+                            events_fd,
+                            {
+                                "type": "chaos_pulse",
+                                "trial": trial,
+                                "kick": cfg.chaos_kick_xy,
+                                "n_pieces": int(n_kick),
+                                "accepted": True,
+                                "score": R_chaos,
+                                "R": R_chaos,
+                                "scs": scs_round.tolist(),
+                                "label": "chaos_pulse",
+                            },
+                        )
+                        accepted = True
+            if not accepted:
+                stats["since_insert"] += 1
+                ar.append_event(
+                    events_fd,
+                    {
+                        "type": "chaos_pulse",
+                        "trial": trial,
+                        "kick": cfg.chaos_kick_xy,
+                        "n_pieces": int(n_kick),
+                        "accepted": False,
+                        "R": R_chaos,
+                    },
+                )
+            continue
 
         # ---- restart policy (fires on since_insert — any accept, not just new best)
         if stats["since_insert"] >= cfg.K_restart:
@@ -739,12 +814,43 @@ def run(cfg: DriverConfig) -> dict:
     _snapshot()
     os.close(events_fd)
     elapsed = time.time() - t_start
+
+    # Determine exit reason for the done flag (D8). Same precedence as _time_up.
+    if stop_requested[0]:
+        exit_reason = "sigterm"
+    elif cfg.stop_flag and Path(cfg.stop_flag).exists():
+        exit_reason = "stop_flag"
+    elif cfg.max_iters is not None and stats["iters"] >= cfg.max_iters:
+        exit_reason = "max_iters"
+    else:
+        exit_reason = "time_up"
+
     summary = {
         "elapsed_s": elapsed,
         "best_score": best_score,
         "archive_size": archive.size(),
+        "exit_reason": exit_reason,
         **stats,
     }
+
+    # done_mbh.flag: orchestrator's signal of clean shutdown vs crash. Atomic
+    # write next to archive.json so workers + supervisor agree on location.
+    flag_path = Path(cfg.archive_path).parent / "done_mbh.flag"
+    flag_payload = {
+        "exit_reason": exit_reason,
+        "final_R": best_score,
+        "archive_size": archive.size(),
+        "iters": stats["iters"],
+        "elapsed_s": elapsed,
+    }
+    flag_tmp = flag_path.with_suffix(flag_path.suffix + ".tmp")
+    flag_tmp.parent.mkdir(parents=True, exist_ok=True)
+    with open(flag_tmp, "w") as f:
+        json.dump(flag_payload, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(flag_tmp, flag_path)
+
     print(f"[mbh] done: {summary}")
     return summary
 
@@ -765,6 +871,24 @@ def main():
         choices=["default", "explore", "exploit"],
         help="move-mix profile (explore=topology-heavy, exploit=local-heavy)",
     )
+    ap.add_argument(
+        "--chaos-pulse-every-iters",
+        type=int,
+        default=0,
+        help="fire chaos pulse every N trials (0 = off)",
+    )
+    ap.add_argument(
+        "--chaos-kick-xy",
+        type=float,
+        default=0.10,
+        help="displacement magnitude for chaos pulse",
+    )
+    ap.add_argument(
+        "--chaos-n-pieces",
+        type=int,
+        default=4,
+        help="number of pieces displaced per chaos pulse",
+    )
     args = ap.parse_args()
 
     Path(args.events).parent.mkdir(parents=True, exist_ok=True)
@@ -778,6 +902,9 @@ def main():
         seed=args.seed,
         stop_flag=args.stop_flag,
         profile=args.profile,
+        chaos_pulse_every_iters=args.chaos_pulse_every_iters,
+        chaos_kick_xy=args.chaos_kick_xy,
+        chaos_n_pieces=args.chaos_n_pieces,
     )
     summary = run(cfg)
     return summary
