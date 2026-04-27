@@ -51,12 +51,17 @@ TIGHT_TARGETED_SIGMA_THETA = 0.20
 TIGHT_TARGETED_K_MIN = 1
 TIGHT_TARGETED_K_MAX = 3
 TIGHT_TARGETED_SELECT_ATTEMPTS = 4
+WIDE_SIGMA_XY = 0.30
+WIDE_SIGMA_THETA = 0.40
+WIDE_K_MIN = 4
+WIDE_K_MAX = 6
 
 __all__ = [
     "make_library",
     "from_random",
     "from_perturbation",
     "from_perturbation_tight",
+    "from_perturbation_wide",
     "from_ring",
     "from_hex",
     "_resolve_overlaps",
@@ -313,6 +318,32 @@ def from_perturbation_tight(
     return best
 
 
+def from_perturbation_wide(
+    rng: np.random.Generator,
+    base_pool: Optional[List[np.ndarray]] = None,
+    repo_root: str | os.PathLike | None = None,
+) -> np.ndarray:
+    """Aggressive K=4-6 piece perturbation of a near-incumbent base.
+
+    Wider sigma than perturbation_tight: explores topology basins one or two
+    contact-graph hops away from the incumbent. Bridges the gap between
+    perturbation_tight (stays in basin) and from_random (lands far away).
+    """
+    if base_pool is None:
+        base_pool = _load_near_incumbent_pool(
+            _repo_root_path(repo_root),
+            TIGHT_NEAR_INCUMBENT_DELTA,
+        )
+    if not base_pool:
+        raise ValueError("perturbation_wide requires a near-incumbent base pool")
+    base = base_pool[int(rng.integers(0, len(base_pool)))]
+    out = base.copy()
+    k = int(rng.integers(WIDE_K_MIN, WIDE_K_MAX + 1))
+    idx = np.sort(rng.choice(N, size=k, replace=False))
+    _apply_xy_theta_noise(out, rng, idx, WIDE_SIGMA_XY, WIDE_SIGMA_THETA)
+    return out
+
+
 def from_ring(rng: np.random.Generator) -> np.ndarray:
     """5 pieces on inner ring r=1.1, 10 on outer ring r=2.5.
 
@@ -427,7 +458,7 @@ def _write_seed(path: Path, scs: np.ndarray) -> Optional[float]:
 
 
 _DEFAULT_SOURCES = ("random", "perturbation", "ring", "hex")
-_SOURCES = (*_DEFAULT_SOURCES, "perturbation_tight")
+_SOURCES = (*_DEFAULT_SOURCES, "perturbation_tight", "perturbation_wide")
 
 
 def _validated_sources(sources: Iterable[str]) -> List[str]:
@@ -455,6 +486,12 @@ def _generate_one(
         return from_hex(rng)
     if kind == "perturbation_tight":
         return from_perturbation_tight(
+            rng,
+            base_pool=tight_base_pool,
+            repo_root=repo_root,
+        )
+    if kind == "perturbation_wide":
+        return from_perturbation_wide(
             rng,
             base_pool=tight_base_pool,
             repo_root=repo_root,
@@ -516,9 +553,12 @@ def make_library(
         tempfile.mkdtemp(dir=out_path.parent, prefix=f".seeds.tmp.{os.getpid()}.")
     )
     base_pool = _load_seed_pool(repo_root_path)
+    needs_near_pool = any(
+        kind in active_sources for kind in ("perturbation_tight", "perturbation_wide")
+    )
     tight_base_pool = (
         _load_near_incumbent_pool(repo_root_path, TIGHT_NEAR_INCUMBENT_DELTA)
-        if "perturbation_tight" in active_sources
+        if needs_near_pool
         else None
     )
 
