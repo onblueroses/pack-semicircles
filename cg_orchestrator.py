@@ -58,6 +58,8 @@ def _run_seed(
     hours: float,
     out_root_str: str,
     repo_root_str: str,
+    lookahead_depth: int = 1,
+    lookahead_beam: int = 5,
 ) -> dict[str, Any]:
     seed_path = Path(seed_path_str)
     out_root = Path(out_root_str)
@@ -79,6 +81,10 @@ def _run_seed(
         str(hours),
         "--out",
         str(out_dir),
+        "--lookahead-depth",
+        str(lookahead_depth),
+        "--lookahead-beam",
+        str(lookahead_beam),
     ]
     returncode = -1
     try:
@@ -193,6 +199,8 @@ def run_campaign(
     hours: float,
     workers: int,
     out_root: Path,
+    lookahead_depth: int = 1,
+    lookahead_beam: int = 5,
 ) -> Path:
     """Run attack4 against every seed_*.json in seed_dir in parallel."""
     seed_dir = Path(seed_dir)
@@ -234,6 +242,8 @@ def run_campaign(
                         hours,
                         str(out_root),
                         str(repo_root),
+                        lookahead_depth,
+                        lookahead_beam,
                     ),
                 )
                 active_tasks[seed_path.stem] = _ActiveTask(
@@ -289,6 +299,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hours", type=float, required=True)
     parser.add_argument("--workers", type=int, required=True)
     parser.add_argument("--out", default=None)
+    parser.add_argument("--lookahead-depth", type=int, default=1)
+    parser.add_argument("--lookahead-beam", type=int, default=5)
     return parser.parse_args(argv)
 
 
@@ -304,6 +316,8 @@ def main(argv: list[str] | None = None) -> int:
         hours=args.hours,
         workers=args.workers,
         out_root=out_root,
+        lookahead_depth=args.lookahead_depth,
+        lookahead_beam=args.lookahead_beam,
     )
     with open(merged_path) as handle:
         payload = json.load(handle)
