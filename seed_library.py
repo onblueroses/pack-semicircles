@@ -239,6 +239,24 @@ def _apply_xy_theta_noise(
     out[idx, 2] += rng.normal(0.0, sigma_theta, size=len(idx))
 
 
+def _validate_non_negative(name: str, value: float) -> float:
+    if value < 0.0:
+        raise ValueError(f"{name} must be >= 0, got {value}")
+    return value
+
+
+def _validate_piece_count_range(k_min: int, k_max: int, label: str) -> tuple[int, int]:
+    if k_min < 1:
+        raise ValueError(f"{label}_k_min must be >= 1, got {k_min}")
+    if k_max > N:
+        raise ValueError(f"{label}_k_max must be <= {N}, got {k_max}")
+    if k_min > k_max:
+        raise ValueError(
+            f"{label}_k_min must be <= {label}_k_max, got {k_min} > {k_max}"
+        )
+    return k_min, k_max
+
+
 def _tight_micro_candidate(base: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     dx = float(rng.normal(0.0, TIGHT_MICRO_SIGMA_XY))
     dy = float(rng.normal(0.0, TIGHT_MICRO_SIGMA_XY))
@@ -321,9 +339,13 @@ def from_perturbation_tight(
 def from_perturbation_wide(
     rng: np.random.Generator,
     base_pool: Optional[List[np.ndarray]] = None,
+    sigma_xy: float = WIDE_SIGMA_XY,
+    sigma_theta: float = WIDE_SIGMA_THETA,
+    k_min: int = WIDE_K_MIN,
+    k_max: int = WIDE_K_MAX,
     repo_root: str | os.PathLike | None = None,
 ) -> np.ndarray:
-    """Aggressive K=4-6 piece perturbation of a near-incumbent base.
+    """Aggressive multi-piece perturbation of a near-incumbent base.
 
     Wider sigma than perturbation_tight: explores topology basins one or two
     contact-graph hops away from the incumbent. Bridges the gap between
@@ -338,9 +360,12 @@ def from_perturbation_wide(
         raise ValueError("perturbation_wide requires a near-incumbent base pool")
     base = base_pool[int(rng.integers(0, len(base_pool)))]
     out = base.copy()
-    k = int(rng.integers(WIDE_K_MIN, WIDE_K_MAX + 1))
+    _validate_non_negative("wide_sigma_xy", sigma_xy)
+    _validate_non_negative("wide_sigma_theta", sigma_theta)
+    k_min, k_max = _validate_piece_count_range(k_min, k_max, "wide")
+    k = int(rng.integers(k_min, k_max + 1))
     idx = np.sort(rng.choice(N, size=k, replace=False))
-    _apply_xy_theta_noise(out, rng, idx, WIDE_SIGMA_XY, WIDE_SIGMA_THETA)
+    _apply_xy_theta_noise(out, rng, idx, sigma_xy, sigma_theta)
     return out
 
 
@@ -475,6 +500,10 @@ def _generate_one(
     base_pool: List[np.ndarray],
     tight_base_pool: Optional[List[np.ndarray]],
     repo_root: Path,
+    wide_sigma_xy: float,
+    wide_sigma_theta: float,
+    wide_k_min: int,
+    wide_k_max: int,
 ) -> np.ndarray:
     if kind == "random":
         return from_random(rng)
@@ -494,6 +523,10 @@ def _generate_one(
         return from_perturbation_wide(
             rng,
             base_pool=tight_base_pool,
+            sigma_xy=wide_sigma_xy,
+            sigma_theta=wide_sigma_theta,
+            k_min=wide_k_min,
+            k_max=wide_k_max,
             repo_root=repo_root,
         )
     raise ValueError(f"unknown kind: {kind}")
@@ -532,6 +565,10 @@ def make_library(
     sources: Iterable[str] = _DEFAULT_SOURCES,
     repo_root: str | os.PathLike | None = None,
     extra_per_source: Mapping[str, int] | None = None,
+    wide_sigma_xy: float = WIDE_SIGMA_XY,
+    wide_sigma_theta: float = WIDE_SIGMA_THETA,
+    wide_k_min: int = WIDE_K_MIN,
+    wide_k_max: int = WIDE_K_MAX,
 ) -> List[Path]:
     """Generate n_per_kind seeds per baseline source, plus any opt-in extras.
 
@@ -547,6 +584,9 @@ def make_library(
             active_sources.append(kind)
 
     repo_root_path = _repo_root_path(repo_root)
+    _validate_non_negative("wide_sigma_xy", wide_sigma_xy)
+    _validate_non_negative("wide_sigma_theta", wide_sigma_theta)
+    wide_k_min, wide_k_max = _validate_piece_count_range(wide_k_min, wide_k_max, "wide")
     out_path = Path(out_dir)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = Path(
@@ -566,7 +606,17 @@ def make_library(
     for kind in active_sources:
         rng = _rng_for_source(seed, kind)
         for i in range(n_per_kind if kind in source_set else 0):
-            raw = _generate_one(kind, rng, base_pool, tight_base_pool, repo_root_path)
+            raw = _generate_one(
+                kind,
+                rng,
+                base_pool,
+                tight_base_pool,
+                repo_root_path,
+                wide_sigma_xy,
+                wide_sigma_theta,
+                wide_k_min,
+                wide_k_max,
+            )
             resolved = _resolve_overlaps(raw)
             final_path = out_path / f"seed_{kind}_{i}.json"
             tmp_file = tmp_path / f"seed_{kind}_{i}.json"
@@ -574,7 +624,17 @@ def make_library(
             written.append(final_path)
         for extra_idx in range(extra_counts[kind]):
             i = n_per_kind + extra_idx
-            raw = _generate_one(kind, rng, base_pool, tight_base_pool, repo_root_path)
+            raw = _generate_one(
+                kind,
+                rng,
+                base_pool,
+                tight_base_pool,
+                repo_root_path,
+                wide_sigma_xy,
+                wide_sigma_theta,
+                wide_k_min,
+                wide_k_max,
+            )
             resolved = _resolve_overlaps(raw)
             final_path = out_path / f"seed_{kind}_{i}.json"
             tmp_file = tmp_path / f"seed_{kind}_{i}.json"
@@ -615,6 +675,11 @@ if __name__ == "__main__":
     ap.add_argument("--n-per-kind", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument(
+        "--repo-root",
+        default=None,
+        help="override repo root used to load pool/best.json and diverse_*.json",
+    )
+    ap.add_argument(
         "--source-weight",
         action="append",
         default=[],
@@ -622,6 +687,10 @@ if __name__ == "__main__":
         metavar="kind:N",
         help="add N extra seeds for the named source on top of --n-per-kind",
     )
+    ap.add_argument("--wide-sigma-xy", type=float, default=WIDE_SIGMA_XY)
+    ap.add_argument("--wide-sigma-theta", type=float, default=WIDE_SIGMA_THETA)
+    ap.add_argument("--wide-k-min", type=int, default=WIDE_K_MIN)
+    ap.add_argument("--wide-k-max", type=int, default=WIDE_K_MAX)
     args = ap.parse_args()
     extra_per_source: dict[str, int] = {}
     for kind, extra in args.source_weight:
@@ -630,7 +699,12 @@ if __name__ == "__main__":
         args.out,
         args.n_per_kind,
         args.seed,
+        repo_root=args.repo_root,
         extra_per_source=extra_per_source or None,
+        wide_sigma_xy=args.wide_sigma_xy,
+        wide_sigma_theta=args.wide_sigma_theta,
+        wide_k_min=args.wide_k_min,
+        wide_k_max=args.wide_k_max,
     )
     feasible = 0
     for p in paths:

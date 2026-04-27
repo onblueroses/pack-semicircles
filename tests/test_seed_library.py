@@ -213,6 +213,26 @@ def test_from_perturbation_tight_stays_near_incumbent():
     assert feasible_pre_resolve / 30 >= 0.40, feasible_pre_resolve
 
 
+def test_from_perturbation_tight_honors_custom_repo_root(tmp_path: Path):
+    repo_root = tmp_path / "anchor-repo"
+    pool_dir = repo_root / "pool"
+    base = _best_scs()
+    anchor = base.copy()
+    anchor[:, 0] += 1.5
+    anchor[:, 1] -= 0.75
+    anchor_rounded = geom.rnd(anchor)
+    _write_seed_json(pool_dir / "best.json", anchor)
+
+    scs = seed_library.from_perturbation_tight(
+        np.random.default_rng(0), repo_root=repo_root
+    )
+    anchor_xy_delta = float(np.max(np.abs(scs[:, :2] - anchor_rounded[:, :2])))
+    original_xy_delta = float(np.max(np.abs(scs[:, :2] - geom.rnd(base)[:, :2])))
+
+    assert anchor_xy_delta < 0.6, anchor_xy_delta
+    assert original_xy_delta > 0.6, original_xy_delta
+
+
 def test_from_perturbation_tight_raises_without_incumbent(tmp_path: Path):
     repo_root = tmp_path / "repo"
     pool_dir = repo_root / "pool"
@@ -222,6 +242,20 @@ def test_from_perturbation_tight_raises_without_incumbent(tmp_path: Path):
         seed_library.from_perturbation_tight(
             np.random.default_rng(0), repo_root=repo_root
         )
+
+
+def test_from_perturbation_wide_respects_override_range():
+    base = _best_scs()
+    scs = seed_library.from_perturbation_wide(
+        np.random.default_rng(0),
+        base_pool=[base],
+        sigma_xy=0.50,
+        sigma_theta=seed_library.WIDE_SIGMA_THETA,
+        k_min=6,
+        k_max=8,
+    )
+    changed = int(np.count_nonzero(np.max(np.abs(scs - base), axis=1) > 1e-12))
+    assert 6 <= changed <= 8, changed
 
 
 def test_extra_per_source_produces_extra_files(tmp_path: Path):
