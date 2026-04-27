@@ -1,11 +1,12 @@
 """Diverse 15-piece seed generator for the contact-graph search pipeline.
 
-Generates seeds from four constructive sources (random, perturbation, ring, hex)
+Generates seeds from five constructive sources
+(random, perturbation, perturbation_tight, ring, hex)
 then runs an analytic overlap resolver before scoring with geom.mec. Output
 schema mirrors pool/best.json so attack4.load_seed can read the files
 unmodified.
 
-Why four sources, not one: each source biases the contact topology that
+Why multiple sources, not one: each source biases the contact topology that
 emerges after relaxation. attack4's Stage A explores from whatever topology a
 seed lands on, so monoculture seeds give monoculture topologies. The unit
 test test_topology_diversity enforces >=4 distinct contact-feature signatures
@@ -25,8 +26,9 @@ import math
 import os
 import shutil
 import tempfile
+from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -42,11 +44,18 @@ RING_INNER = 1.1
 RING_OUTER = 2.5
 PERTURB_SIGMA_XY = 0.20
 PERTURB_SIGMA_THETA = 0.40
+TIGHT_MICRO_SIGMA_XY = 0.01
+TIGHT_MICRO_SIGMA_THETA = 0.025
+TIGHT_TARGETED_SIGMA_XY = 0.10
+TIGHT_TARGETED_SIGMA_THETA = 0.20
+TIGHT_TARGETED_K_MIN = 1
+TIGHT_TARGETED_K_MAX = 3
 
 __all__ = [
     "make_library",
     "from_random",
     "from_perturbation",
+    "from_perturbation_tight",
     "from_ring",
     "from_hex",
     "_resolve_overlaps",
@@ -160,6 +169,52 @@ def _load_seed_pool(repo_root: Path) -> List[np.ndarray]:
     return pool
 
 
+def _repo_root_path(repo_root: str | os.PathLike | None) -> Path:
+    return Path(repo_root) if repo_root is not None else Path(__file__).resolve().parent
+
+
+def _resolved_base_pool(
+    base_pool: Optional[List[np.ndarray]],
+    repo_root: str | os.PathLike | None,
+) -> List[np.ndarray]:
+    if base_pool is not None:
+        return base_pool
+    return _load_seed_pool(_repo_root_path(repo_root))
+
+
+def _base_seed(
+    rng: np.random.Generator,
+    base_pool: Optional[List[np.ndarray]],
+    repo_root: str | os.PathLike | None,
+) -> Optional[np.ndarray]:
+    base_pool = _resolved_base_pool(base_pool, repo_root)
+    if not base_pool:
+        return None
+    return base_pool[rng.integers(0, len(base_pool))]
+
+
+def _incumbent_seed(
+    base_pool: Optional[List[np.ndarray]],
+    repo_root: str | os.PathLike | None,
+) -> Optional[np.ndarray]:
+    base_pool = _resolved_base_pool(base_pool, repo_root)
+    if not base_pool:
+        return None
+    return base_pool[0]
+
+
+def _apply_xy_theta_noise(
+    out: np.ndarray,
+    rng: np.random.Generator,
+    idx: np.ndarray,
+    sigma_xy: float,
+    sigma_theta: float,
+) -> None:
+    out[idx, 0] += rng.normal(0.0, sigma_xy, size=len(idx))
+    out[idx, 1] += rng.normal(0.0, sigma_xy, size=len(idx))
+    out[idx, 2] += rng.normal(0.0, sigma_theta, size=len(idx))
+
+
 def from_perturbation(
     rng: np.random.Generator,
     base_pool: Optional[List[np.ndarray]] = None,
@@ -168,23 +223,68 @@ def from_perturbation(
     repo_root: str | os.PathLike | None = None,
 ) -> np.ndarray:
     """Pick a base from pool (best.json + diverse_*.json), add Gaussian noise."""
-    if base_pool is None:
-        repo_root = (
-            Path(repo_root)
-            if repo_root is not None
-            else Path(__file__).resolve().parent
-        )
-        base_pool = _load_seed_pool(repo_root)
-    if not base_pool:
+    base = _base_seed(rng, base_pool, repo_root)
+    if base is None:
         # No incumbent available: fall back to random so make_library never
         # silently produces zero perturbation seeds.
         return from_random(rng)
-    base = base_pool[rng.integers(0, len(base_pool))]
     out = base.copy()
-    out[:, 0] += rng.normal(0.0, sigma_xy, size=N)
-    out[:, 1] += rng.normal(0.0, sigma_xy, size=N)
-    out[:, 2] += rng.normal(0.0, sigma_theta, size=N)
+    _apply_xy_theta_noise(out, rng, np.arange(N), sigma_xy, sigma_theta)
     return out
+
+
+def _from_perturbation_tight_regime(
+    rng: np.random.Generator,
+    regime: str,
+    base_pool: Optional[List[np.ndarray]] = None,
+    repo_root: str | os.PathLike | None = None,
+) -> np.ndarray:
+    base = _incumbent_seed(base_pool, repo_root)
+    if base is None:
+        return from_random(rng)
+    out = base.copy()
+    if regime == "micro":
+        _apply_xy_theta_noise(
+            out,
+            rng,
+            np.arange(N),
+            TIGHT_MICRO_SIGMA_XY,
+            TIGHT_MICRO_SIGMA_THETA,
+        )
+        return out
+    if regime == "targeted":
+        k = int(rng.integers(TIGHT_TARGETED_K_MIN, TIGHT_TARGETED_K_MAX + 1))
+        idx = np.sort(rng.choice(N, size=k, replace=False))
+        dx = rng.normal(0.0, TIGHT_TARGETED_SIGMA_XY, size=k)
+        dy = rng.normal(0.0, TIGHT_TARGETED_SIGMA_XY, size=k)
+        dtheta = rng.normal(0.0, TIGHT_TARGETED_SIGMA_THETA, size=k)
+        for scale in (1.0, 0.5):
+            trial = base.copy()
+            trial[idx, 0] += dx * scale
+            trial[idx, 1] += dy * scale
+            trial[idx, 2] += dtheta * scale
+            if geom.cnt(geom.rnd(_resolve_overlaps(trial))) == 0:
+                return trial
+        out[idx, 0] += dx * 0.5
+        out[idx, 1] += dy * 0.5
+        out[idx, 2] += dtheta * 0.5
+        return out
+    raise ValueError(f"unknown perturbation_tight regime: {regime}")
+
+
+def from_perturbation_tight(
+    rng: np.random.Generator,
+    base_pool: Optional[List[np.ndarray]] = None,
+    repo_root: str | os.PathLike | None = None,
+) -> np.ndarray:
+    """Perturb an incumbent seed lightly, favoring nearby topology neighbors."""
+    regime = "micro" if rng.random() < 0.5 else "targeted"
+    return _from_perturbation_tight_regime(
+        rng,
+        regime,
+        base_pool=base_pool,
+        repo_root=repo_root,
+    )
 
 
 def from_ring(rng: np.random.Generator) -> np.ndarray:
@@ -300,7 +400,7 @@ def _write_seed(path: Path, scs: np.ndarray) -> Optional[float]:
 # ---------- top-level orchestration ----------
 
 
-_SOURCES = ("random", "perturbation", "ring", "hex")
+_SOURCES = ("random", "perturbation", "ring", "hex", "perturbation_tight")
 
 
 def _generate_one(
@@ -308,6 +408,7 @@ def _generate_one(
     rng: np.random.Generator,
     base_pool: List[np.ndarray],
     repo_root: Path,
+    variant_index: int = 0,
 ) -> np.ndarray:
     if kind == "random":
         return from_random(rng)
@@ -317,7 +418,33 @@ def _generate_one(
         return from_ring(rng)
     if kind == "hex":
         return from_hex(rng)
+    if kind == "perturbation_tight":
+        regime = "micro" if variant_index % 2 == 0 else "targeted"
+        return _from_perturbation_tight_regime(
+            rng,
+            regime,
+            base_pool=base_pool,
+            repo_root=repo_root,
+        )
     raise ValueError(f"unknown kind: {kind}")
+
+
+def _normalized_source_weights(
+    sources: Iterable[str],
+    source_weights: Mapping[str, int] | None,
+) -> dict[str, int]:
+    counts = {kind: 0 for kind in sources}
+    if source_weights is None:
+        return counts
+    for kind, extra in source_weights.items():
+        if kind not in counts:
+            raise ValueError(f"unknown source weight kind: {kind}")
+        if isinstance(extra, bool) or not isinstance(extra, int):
+            raise ValueError(f"source weight for {kind} must be an int, got {extra!r}")
+        if extra < 0:
+            raise ValueError(f"source weight for {kind} must be >= 0, got {extra}")
+        counts[kind] += extra
+    return counts
 
 
 def make_library(
@@ -326,6 +453,7 @@ def make_library(
     seed: int = 0,
     sources: Iterable[str] = _SOURCES,
     repo_root: str | os.PathLike | None = None,
+    source_weights: Mapping[str, int] | None = None,
 ) -> List[Path]:
     """Generate n_per_kind seeds for each source, resolve overlaps, write JSON.
 
@@ -333,9 +461,8 @@ def make_library(
     sub-stream so adding/removing one source doesn't shift others' RNG.
     """
     sources = list(sources)
-    repo_root_path = (
-        Path(repo_root) if repo_root is not None else Path(__file__).resolve().parent
-    )
+    extra_counts = _normalized_source_weights(sources, source_weights)
+    repo_root_path = _repo_root_path(repo_root)
     out_path = Path(out_dir)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = Path(
@@ -346,8 +473,9 @@ def make_library(
     parent_seeds = np.random.SeedSequence(seed).spawn(len(sources))
     for src_idx, kind in enumerate(sources):
         rng = np.random.default_rng(parent_seeds[src_idx])
-        for i in range(n_per_kind):
-            raw = _generate_one(kind, rng, base_pool, repo_root_path)
+        total_count = n_per_kind + extra_counts[kind]
+        for i in range(total_count):
+            raw = _generate_one(kind, rng, base_pool, repo_root_path, variant_index=i)
             resolved = _resolve_overlaps(raw)
             final_path = out_path / f"seed_{kind}_{i}.json"
             tmp_file = tmp_path / f"seed_{kind}_{i}.json"
@@ -364,12 +492,46 @@ def make_library(
 if __name__ == "__main__":
     import argparse
 
+    def parse_source_weight(spec: str) -> tuple[str, int]:
+        kind, sep, raw_count = spec.partition(":")
+        if not sep or not kind or not raw_count:
+            raise argparse.ArgumentTypeError(
+                f"invalid --source-weight {spec!r}; expected kind:N"
+            )
+        try:
+            extra = int(raw_count)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"invalid --source-weight {spec!r}; N must be an integer"
+            ) from exc
+        if extra < 0:
+            raise argparse.ArgumentTypeError(
+                f"invalid --source-weight {spec!r}; N must be >= 0"
+            )
+        return kind, extra
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="pool/seeds")
     ap.add_argument("--n-per-kind", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--source-weight",
+        action="append",
+        default=[],
+        type=parse_source_weight,
+        metavar="kind:N",
+        help="add N extra seeds for the named source on top of --n-per-kind",
+    )
     args = ap.parse_args()
-    paths = make_library(args.out, args.n_per_kind, args.seed)
+    source_weights: dict[str, int] = {}
+    for kind, extra in args.source_weight:
+        source_weights[kind] = source_weights.get(kind, 0) + extra
+    paths = make_library(
+        args.out,
+        args.n_per_kind,
+        args.seed,
+        source_weights=source_weights or None,
+    )
     feasible = 0
     for p in paths:
         with open(p) as f:
