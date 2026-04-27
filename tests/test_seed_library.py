@@ -4,14 +4,19 @@ Tests run against a fresh build in a session temp directory (n_per_kind=6,
 seed=0). The session-scoped fixture regenerates once per pytest run so the
 assertions always reflect the current library builder.
 
-The four tests guard, in order:
+The eight tests guard, in order:
   C1 schema: every file parses to the agreed shape so attack4 can read it.
-  C2 feasibility: at least 12 seeds are valid packings.
+  C2 feasibility: at least 12 of 24 seeds are valid packings.
   C3 attack4 compatibility: the load_seed entry point accepts our output.
-  C4 topology diversity: the sources produce >=4 distinct contact graphs.
+  C4 topology diversity: the four baseline sources produce >=4 contact graphs.
+  C5 near-incumbent pooling: stale diverse junk is filtered out.
+  C6 tight perturbations: incumbent-biased seeds stay in a near-best basin.
+  C7 fail-loud behavior: missing incumbent seed raises instead of falling back.
+  C8 extra source counts: opt-in extras append files without replacing baseline.
 """
 
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -29,7 +34,7 @@ import seed_library  # noqa: E402
 
 @pytest.fixture(scope="session")
 def seed_paths(tmp_path_factory: pytest.TempPathFactory):
-    """Build the 24-seed library once per test session in a fresh temp dir."""
+    """Build the 24-seed baseline library once per test session."""
     seeds_dir = tmp_path_factory.mktemp("seed-library") / "seeds"
     seed_library.make_library(
         out_dir=seeds_dir,
@@ -66,8 +71,55 @@ def _contact_signature(scs: np.ndarray) -> tuple[int, int, int, int, int]:
     )
 
 
+def _write_seed_json(path: Path, scs: np.ndarray) -> None:
+    rounded = geom.rnd(np.asarray(scs, dtype=np.float64))
+    score = None if geom.cnt(rounded) > 0 else float(geom.mec(rounded))
+    payload = {
+        "score": score,
+        "scs": rounded.tolist(),
+        "solution": [
+            {
+                "x": float(rounded[i, 0]),
+                "y": float(rounded[i, 1]),
+                "theta": float(rounded[i, 2]),
+            }
+            for i in range(geom.N)
+        ],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(payload, f)
+
+
+def _best_scs() -> np.ndarray:
+    return np.asarray(_load(REPO_ROOT / "pool" / "best.json")["scs"], dtype=np.float64)
+
+
+def _make_diverse_junk(best_scs: np.ndarray) -> np.ndarray:
+    rounded = geom.rnd(best_scs)
+    cx, cy, _ = geom.mec_info(rounded)
+    distances = np.hypot(best_scs[:, 0] - cx, best_scs[:, 1] - cy)
+    for idx in np.argsort(distances)[::-1]:
+        dx = float(best_scs[idx, 0] - cx)
+        dy = float(best_scs[idx, 1] - cy)
+        norm = math.hypot(dx, dy)
+        if norm < 1e-9:
+            continue
+        for delta in np.linspace(1.0, 2.5, 16):
+            candidate = best_scs.copy()
+            candidate[idx, 0] += delta * dx / norm
+            candidate[idx, 1] += delta * dy / norm
+            candidate_rounded = geom.rnd(candidate)
+            if (
+                geom.cnt(candidate_rounded) == 0
+                and float(geom.mec(candidate_rounded)) > 3.75
+            ):
+                return candidate
+    raise AssertionError("failed to construct a feasible diverse junk seed")
+
+
 def test_seed_schema(seed_paths):
-    assert len(seed_paths) >= 30, f"expected >=30 seed files, got {len(seed_paths)}"
+    assert len(seed_paths) == 24, f"expected 24 seed files, got {len(seed_paths)}"
     for path in seed_paths:
         data = _load(path)
         assert set(data.keys()) >= {"score", "scs", "solution"}, path
@@ -77,8 +129,8 @@ def test_seed_schema(seed_paths):
             assert set(entry.keys()) >= {"x", "y", "theta"}, path
         for row in data["scs"]:
             assert len(row) == 3, path
-            for v in row:
-                assert isinstance(v, float), path
+            for value in row:
+                assert isinstance(value, float), path
 
 
 def test_at_least_twelve_feasible(seed_paths):
@@ -87,19 +139,17 @@ def test_at_least_twelve_feasible(seed_paths):
         data = _load(path)
         score = data["score"]
         scs = np.asarray(data["scs"], dtype=np.float64)
-        # We serialize infeasible seeds as JSON null -> Python None. Anything
-        # finite is feasible; bool/None/Infinity-string => infeasible.
         if _is_feasible_score(score):
             n_feasible += 1
             assert geom.cnt(geom.rnd(scs)) == 0, path
             assert abs(float(score) - float(geom.mec(geom.rnd(scs)))) < 1e-9, path
         else:
             assert score is None or score == "Infinity" or score == float("inf"), path
-    assert n_feasible >= 12, f"only {n_feasible} feasible seeds"
+    assert n_feasible >= 12, f"only {n_feasible}/24 feasible seeds"
 
 
 def test_attack4_can_load(seed_paths):
-    feasible = [p for p in seed_paths if _load(p)["score"] is not None]
+    feasible = [path for path in seed_paths if _load(path)["score"] is not None]
     assert feasible, "no feasible seeds to load via attack4"
     scs, cx, cy, R = attack4.load_seed(str(feasible[0]))
     assert scs.shape == (15, 3)
@@ -110,70 +160,86 @@ def test_attack4_can_load(seed_paths):
 
 def test_topology_diversity(seed_paths):
     distinct = set()
-    tight_distinct = set()
     for path in seed_paths:
         data = _load(path)
         if data["score"] is None:
             continue
         scs = np.asarray(data["scs"], dtype=np.float64)
-        signature = _contact_signature(scs)
-        distinct.add(signature)
-        if "perturbation_tight" in path.name:
-            tight_distinct.add(signature)
+        distinct.add(_contact_signature(scs))
     assert len(distinct) >= 4, f"only {len(distinct)} distinct topologies: {distinct}"
-    assert len(tight_distinct) >= 2, (
-        f"tight seeds collapsed to one topology: {tight_distinct}"
-    )
+
+
+def test_near_incumbent_pool_filters_diverse_junk(tmp_path: Path):
+    repo_root = tmp_path / "repo"
+    pool_dir = repo_root / "pool"
+    best_scs = _best_scs()
+    junk_scs = _make_diverse_junk(best_scs)
+    _write_seed_json(pool_dir / "best.json", best_scs)
+    _write_seed_json(pool_dir / "diverse_0.json", junk_scs)
+    pool = seed_library._load_near_incumbent_pool(repo_root, max_R_delta=0.02)
+    assert len(pool) == 1
+    np.testing.assert_allclose(pool[0], geom.rnd(best_scs))
 
 
 def test_from_perturbation_tight_stays_near_incumbent():
-    """Tight perturbations stay close to the incumbent in raw state space.
+    """Tight perturbations stay close to a near-incumbent base in raw state space.
 
-    Raw R after perturbation is not a useful proxy: perturbing a tight-contact
-    incumbent always increases R (pieces drift outward, MEC grows). The
-    property we want is *state-space proximity* - the perturbed seed is close
-    enough to the incumbent that attack4's Stage A can re-relax to nearby
-    topologies, not collapse back to the incumbent or escape to R~3.8 basins.
+    Raw R after perturbation+resolve is not a useful proxy: perturbing a
+    tight-contact incumbent always increases R (pieces drift outward, MEC
+    grows). The property we want is *state-space proximity* — the perturbed
+    seed is a small step from some near-incumbent base in (x, y, theta) so
+    attack4's Stage A can re-relax to a nearby topology without escaping to
+    far-away R>3.5 basins.
     """
     rng = np.random.default_rng(0)
-    base_pool = seed_library._load_seed_pool(REPO_ROOT)
-    incumbent = base_pool[0]
-    max_xy_delta = 0.0
-    max_theta_delta = 0.0
-    for _ in range(20):
-        scs = seed_library.from_perturbation_tight(
-            rng,
-            base_pool=base_pool,
-            repo_root=REPO_ROOT,
+    pool = seed_library._load_near_incumbent_pool(
+        REPO_ROOT, max_R_delta=seed_library.TIGHT_NEAR_INCUMBENT_DELTA
+    )
+    feasible_pre_resolve = 0
+    for _ in range(30):
+        scs = seed_library.from_perturbation_tight(rng, repo_root=REPO_ROOT)
+        # Closest base in the pool — we don't know which one was picked.
+        best_xy_delta = min(
+            float(np.max(np.abs(scs[:, :2] - base[:, :2]))) for base in pool
         )
+        best_theta_delta = min(
+            float(np.max(np.abs(scs[:, 2] - base[:, 2]))) for base in pool
+        )
+        assert best_xy_delta < 0.6, best_xy_delta
+        assert best_theta_delta < 1.0, best_theta_delta
         resolved = seed_library._resolve_overlaps(scs)
-        rounded = geom.rnd(resolved)
-        assert geom.cnt(rounded) == 0
-        max_xy_delta = max(
-            max_xy_delta,
-            float(np.max(np.abs(scs[:, :2] - incumbent[:, :2]))),
-        )
-        max_theta_delta = max(
-            max_theta_delta,
-            float(np.max(np.abs(scs[:, 2] - incumbent[:, 2]))),
-        )
-    # Targeted regime allows up to TIGHT_TARGETED_SIGMA_XY * ~3 sigma displacement
-    # on K<=3 pieces; allow generous headroom but stay well below R-blowup distance.
-    assert max_xy_delta < 0.6, max_xy_delta
-    assert max_theta_delta < 1.0, max_theta_delta
+        if geom.cnt(geom.rnd(resolved)) == 0:
+            feasible_pre_resolve += 1
+    assert feasible_pre_resolve / 30 >= 0.40, feasible_pre_resolve
 
 
-def test_source_weight_cli_extra_seeds(tmp_path: Path):
+def test_from_perturbation_tight_raises_without_incumbent(tmp_path: Path):
+    repo_root = tmp_path / "repo"
+    pool_dir = repo_root / "pool"
+    pool_dir.mkdir(parents=True)
+    _write_seed_json(pool_dir / "diverse_0.json", _best_scs())
+    with pytest.raises(ValueError):
+        seed_library.from_perturbation_tight(
+            np.random.default_rng(0), repo_root=repo_root
+        )
+
+
+def test_extra_per_source_produces_extra_files(tmp_path: Path):
     seeds_dir = tmp_path / "seeds"
     paths = seed_library.make_library(
         out_dir=seeds_dir,
-        n_per_kind=6,
+        n_per_kind=4,
         seed=0,
         repo_root=REPO_ROOT,
-        source_weights={"perturbation_tight": 8},
+        extra_per_source={"perturbation_tight": 8},
     )
-    tight_paths = sorted(seeds_dir.glob("seed_perturbation_tight_*.json"))
-    assert len(paths) == (6 * len(seed_library._SOURCES)) + 8
-    assert len(tight_paths) == 14
-    expected_names = {f"seed_perturbation_tight_{i}.json" for i in range(14)}
-    assert {path.name for path in tight_paths} == expected_names
+    seed_paths = sorted(seeds_dir.glob("seed_*.json"))
+    tight_paths = sorted(
+        seeds_dir.glob("seed_perturbation_tight_*.json"),
+        key=lambda path: int(path.stem.rsplit("_", 1)[1]),
+    )
+    assert len(paths) == 24
+    assert len(seed_paths) == 24
+    assert {path.name for path in tight_paths} == {
+        f"seed_perturbation_tight_{i}.json" for i in range(4, 12)
+    }

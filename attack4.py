@@ -28,7 +28,7 @@ import sys
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Callable, Optional, Tuple, List
+from typing import Callable, Optional, Tuple, List, cast
 
 import numpy as np
 from scipy.optimize import NonlinearConstraint, LinearConstraint
@@ -974,6 +974,135 @@ def stage_b(
     return results
 
 
+def _materialize_stage_b_state(
+    scs: np.ndarray,
+) -> Tuple[np.ndarray, float, float, float, List[Feature], List[Tuple[int, int]]]:
+    scs_arr = np.asarray(scs, dtype=np.float64).copy()
+    rounded = geom.rnd(scs_arr)
+    cx, cy, R = geom.mec_info(rounded)
+    feats, witnesses = extract_contact_graph(
+        np.asarray(rounded, dtype=np.float64),
+        float(cx),
+        float(cy),
+        float(R),
+    )
+    return scs_arr, float(cx), float(cy), float(R), feats, witnesses
+
+
+def stage_b_lookahead(
+    root_scs: np.ndarray,
+    root_cx: float,
+    root_cy: float,
+    root_R: float,
+    base_feats: List[Feature],
+    base_wit: List[Tuple[int, int]],
+    current_best_R: float,
+    max_depth: int = 3,
+    beam_width: int = 5,
+    workers: int = 1,
+    maxiter: int = 300,
+    margin_pair: float = 2e-6,
+    margin_contain: float = 2e-6,
+    include_pairs: bool = False,
+    log: Callable[[str], None] = print,
+    root_results: Optional[List[dict]] = None,
+) -> Optional[dict]:
+    """Search for a bounded multi-step Stage B improvement."""
+    if max_depth < 1:
+        return None
+    beam_width = max(1, beam_width)
+    frontier = [
+        dict(
+            scs=np.asarray(root_scs, dtype=np.float64).copy(),
+            cx=float(root_cx),
+            cy=float(root_cy),
+            R=float(root_R),
+            feats=list(base_feats),
+            wit=list(base_wit),
+            chain=[],
+            chain_Rs=[],
+        )
+    ]
+    best_chain = None
+    best_chain_R = current_best_R
+
+    for depth in range(1, max_depth + 1):
+        log(f"[lookahead] depth={depth}, frontier_size={len(frontier)}")
+        children = []
+        for node_idx, node in enumerate(frontier):
+            node_scs = cast(np.ndarray, node["scs"])
+            node_cx = cast(float, node["cx"])
+            node_cy = cast(float, node["cy"])
+            node_R = cast(float, node["R"])
+            node_feats = cast(List[Feature], node["feats"])
+            node_wit = cast(List[Tuple[int, int]], node["wit"])
+            node_chain = cast(List[dict], node["chain"])
+            node_chain_Rs = cast(List[float], node["chain_Rs"])
+            if depth == 1 and node_idx == 0 and root_results is not None:
+                results = root_results
+            else:
+                results = stage_b(
+                    node_scs,
+                    node_cx,
+                    node_cy,
+                    node_R,
+                    node_feats,
+                    node_wit,
+                    current_best_R,
+                    workers=workers,
+                    maxiter=maxiter,
+                    margin_pair=margin_pair,
+                    margin_contain=margin_contain,
+                    include_pairs=include_pairs,
+                    log=log,
+                )
+            for r in results:
+                child_R = r.get("rounded_R")
+                if child_R is None or not isinstance(child_R, (int, float)):
+                    continue
+                child_scs, child_cx, child_cy, child_root_R, child_feats, child_wit = (
+                    _materialize_stage_b_state(r["scs"])
+                )
+                child_chain = node_chain + [r["move"]]
+                child_chain_Rs = node_chain_Rs + [float(child_R)]
+                child = dict(
+                    scs=child_scs,
+                    cx=child_cx,
+                    cy=child_cy,
+                    R=child_root_R,
+                    feats=child_feats,
+                    wit=child_wit,
+                    rounded_R=float(child_R),
+                    chain=child_chain,
+                    chain_Rs=child_chain_Rs,
+                )
+                children.append(child)
+                if float(child_R) < best_chain_R - 1e-9:
+                    best_chain_R = float(child_R)
+                    best_chain = dict(
+                        chain=child_chain,
+                        chain_Rs=child_chain_Rs,
+                        final_scs=child_scs,
+                        final_R=float(child_R),
+                        final_feats=child_feats,
+                        final_wit=child_wit,
+                        depth=depth,
+                    )
+
+        if best_chain is not None:
+            log(f"[lookahead] found improver at depth {depth}: R={best_chain_R:.9f}")
+            return best_chain
+
+        children.sort(key=lambda child: float(child["rounded_R"]))
+        frontier = children[:beam_width]
+        if not frontier:
+            log(f"[lookahead] frontier exhausted at depth {depth}")
+            return None
+
+    log(f"[lookahead] no improver within max_depth={max_depth}")
+    return None
+
+
 # ---------- driver ----------
 
 
@@ -1009,6 +1138,18 @@ def main():
     ap.add_argument("--stage-b", action="store_true", help="Run Stage B branching")
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--depth", type=int, default=2, help="Stage B hill-climb depth")
+    ap.add_argument(
+        "--lookahead-depth",
+        type=int,
+        default=1,
+        help="Stage B beam-search lookahead depth. 1 = current behavior (no lookahead).",
+    )
+    ap.add_argument(
+        "--lookahead-beam",
+        type=int,
+        default=5,
+        help="Beam width for lookahead. Top-K non-improving moves kept per depth.",
+    )
     ap.add_argument("--b-maxiter", type=int, default=300)
     ap.add_argument("--margin", type=float, default=2e-6)
     ap.add_argument(
@@ -1148,7 +1289,78 @@ def main():
             log(f"  no depth-{depth} improvement; top 3 non-improving rounded R:")
             for r in results[:3]:
                 log(f"    {r.get('rounded_R')} {r['kind']}")
-            break
+            if args.lookahead_depth <= 1:
+                break
+            lookahead = stage_b_lookahead(
+                current_scs,
+                current_cx,
+                current_cy,
+                current_R,
+                current_feats,
+                current_wit,
+                current_best_R,
+                max_depth=args.lookahead_depth,
+                beam_width=args.lookahead_beam,
+                workers=args.workers,
+                maxiter=args.b_maxiter,
+                margin_pair=args.margin,
+                margin_contain=args.margin,
+                include_pairs=args.pairs,
+                log=log,
+                root_results=results,
+            )
+            if lookahead is None:
+                break
+            log(
+                f"  LOOKAHEAD: depth={lookahead['depth']} "
+                f"rounded={lookahead['final_R']:.9f} "
+                f"(Δ={current_best_R - lookahead['final_R']:.2e})"
+            )
+            common.write_json_atomic(
+                str(out_dir / f"lookahead_d{depth}.json"),
+                dict(
+                    depth=lookahead["depth"],
+                    chain=lookahead["chain"],
+                    parent_R=current_best_R,
+                    final_R=lookahead["final_R"],
+                    final_scs=np.asarray(lookahead["final_scs"]).tolist(),
+                    delta=lookahead["final_R"] - current_best_R,
+                ),
+            )
+            current_best_R = lookahead["final_R"]
+            current_scs = np.asarray(lookahead["final_scs"], dtype=np.float64)
+            rnd = geom.rnd(current_scs)
+            current_cx, current_cy, current_R = geom.mec_info(rnd)
+            current_feats, current_wit = extract_contact_graph(
+                np.asarray(rnd, dtype=np.float64),
+                float(current_cx),
+                float(current_cy),
+                float(current_R),
+            )
+            chain_Rs = lookahead.get("chain_Rs", [])
+            for idx, move in enumerate(lookahead["chain"]):
+                step_R = chain_Rs[idx] if idx < len(chain_Rs) else lookahead["final_R"]
+                history.append(
+                    dict(
+                        stage=f"B_lookahead_d{lookahead['depth']}",
+                        R=step_R,
+                        move=move["kind"],
+                    )
+                )
+            out = dict(
+                score=float(current_best_R),
+                scs=rnd.tolist(),
+                solution=[
+                    {
+                        "x": float(rnd[i, 0]),
+                        "y": float(rnd[i, 1]),
+                        "theta": float(rnd[i, 2]),
+                    }
+                    for i in range(N)
+                ],
+            )
+            common.write_json_atomic(str(out_dir / f"champion_d{depth}.json"), out)
+            continue
         log(
             f"  BEST: {best['kind']} rounded={best['rounded_R']:.9f} "
             f"(Δ={current_best_R - best['rounded_R']:.2e})"
