@@ -22,3 +22,4 @@ debug_overlap.mjs
 test_geom.py
 best_*.json
 done_*.flag
+!pool/best_2_948891.json

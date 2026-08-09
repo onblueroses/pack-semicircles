@@ -4,7 +4,7 @@ Pack 15 unit semicircles into the smallest possible enclosing circle.
 
 An entry for the [Optimization Arena](https://www.optimizationarena.com/packing) semicircle packing challenge. The problem: given 15 semicircles of radius 1, find positions (x, y) and orientations (theta) that minimize the radius of the minimum enclosing circle (MEC), with no overlaps.
 
-**Current best: 2.9589** (theoretical lower bound ~2.74)
+**Current best: 2.948687** (theoretical lower bound ~2.74)
 
 ## Approach
 
